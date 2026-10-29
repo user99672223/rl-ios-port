@@ -1,0 +1,103 @@
+From 81ea4fce277420ad16cd002d06b7fe9d3dc98c6b Mon Sep 17 00:00:00 2001
+From: splitwx <splitwx@local>
+Date: Thu, 29 Oct 2026 06:41:01 +0100
+Subject: [PATCH 203/206] Dispatcher: emit through RW view, run from RX view
+
+---
+ .../Interface/Core/ArchHelpers/Arm64Emitter.cpp   |  4 ++--
+ .../Interface/Core/ArchHelpers/Arm64Emitter.h     |  2 +-
+ .../Interface/Core/Dispatcher/Dispatcher.cpp      | 15 +++++++++++----
+ .../Source/Interface/Core/Dispatcher/Dispatcher.h |  4 ++++
+ 4 files changed, 18 insertions(+), 7 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+index 3ebadb5..6ddb650 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.cpp
+@@ -357,8 +357,8 @@ namespace x32 {
+ } // namespace x32
+ 
+ // We want vixl to not allocate a default buffer. Jit and dispatcher will manually create one.
+-Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr, size_t size)
+-  : Emitter(static_cast<uint8_t*>(EmissionPtr), size)
++Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr, size_t size, intptr_t RXBias)
++  : Emitter(static_cast<uint8_t*>(EmissionPtr), size, RXBias)
+   , EmitterCTX {ctx}
+   , SupportCodeRelocations {ctx->RequiresRelocatableConstants()}
+ #ifdef VIXL_SIMULATOR
+diff --git a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+index 5ad6e7b..23645b2 100644
+--- a/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
++++ b/FEXCore/Source/Interface/Core/ArchHelpers/Arm64Emitter.h
+@@ -107,7 +107,7 @@ constexpr ARMEmitter::PRegister PRED_TMP_32B = ARMEmitter::PReg::p7;
+ // be used by both Arm64 JIT and ARM64 Dispatcher
+ class Arm64Emitter : public ARMEmitter::Emitter {
+ public:
+-  Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr = nullptr, size_t size = 0);
++  Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr = nullptr, size_t size = 0, intptr_t RXBias = 0);
+ 
+   enum class PadType {
+     // Explicitly does not need padding, even if code-caching is enabled.
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+index 2f4babd..bde2e3b 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.cpp
+@@ -37,17 +37,24 @@ static void SleepThread(FEXCore::Context::ContextImpl* CTX, FEXCore::Core::CpuSt
+ constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
+ 
+ Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
+-  : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
++  : Dispatcher(ctx, FEXCore::Allocator::AllocateCodeMemory(MAX_DISPATCHER_CODE_SIZE)) {}
++
++// The dispatcher is emitted through the RW view; every address it records (DispatchPtr, handler
++// addresses, ...) comes from GetCursorAddress and is therefore an RX address.
++Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx, FEXCore::Allocator::CodeMemory Memory)
++  : Arm64Emitter(ctx, Memory.RW, MAX_DISPATCHER_CODE_SIZE, reinterpret_cast<intptr_t>(Memory.RX) - reinterpret_cast<intptr_t>(Memory.RW))
+   , CTX {ctx} {
+   EmitDispatcher();
+ 
+-  FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
++  if (!FEXCore::Allocator::IsCodeMemorySplit()) {
++    FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
++  }
+ }
+ 
+ Dispatcher::~Dispatcher() {
+   auto BufferSize = GetBufferSize();
+   if (BufferSize) {
+-    FEXCore::Allocator::VirtualFree(GetBufferBase(), BufferSize);
++    FEXCore::Allocator::FreeCodeMemory(GetBufferBase(), BufferSize);
+   }
+ }
+ 
+@@ -665,7 +672,7 @@ void Dispatcher::EmitDispatcher() {
+ 
+   Start = reinterpret_cast<uint64_t>(DispatchPtr);
+   End = GetCursorAddress<uint64_t>();
+-  ClearICache(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
++  FEXCore::Allocator::FlushCodeMemory(reinterpret_cast<void*>(DispatchPtr), End - reinterpret_cast<uint64_t>(DispatchPtr));
+ 
+   if (CTX->Config.BlockJITNaming()) {
+     fextl::string Name = fextl::fmt::format("Dispatch_{}", FHU::Syscalls::gettid());
+diff --git a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+index 9df667e..bcc8343 100644
+--- a/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
++++ b/FEXCore/Source/Interface/Core/Dispatcher/Dispatcher.h
+@@ -5,6 +5,7 @@
+ #include "Interface/Core/Interpreter/InterpreterOps.h"
+ 
+ #include <FEXCore/Config/Config.h>
++#include <FEXCore/Utils/CodeMemory.h>
+ #include <FEXCore/fextl/memory.h>
+ 
+ #include <array>
+@@ -113,6 +114,9 @@ private:
+   uint64_t F64FPREMHandlerAddress {};
+   uint64_t F64FPREM1HandlerAddress {};
+ 
++  // Takes the code memory the dispatcher is emitted into: written through RW, executed at RX.
++  Dispatcher(FEXCore::Context::ContextImpl* ctx, FEXCore::Allocator::CodeMemory Memory);
++
+   void EmitDispatcher();
+   uint64_t GenerateABICall(FallbackABI ABI);
+ 
