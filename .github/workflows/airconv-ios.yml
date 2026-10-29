@@ -1,0 +1,78 @@
+# DXMT's shader translator (airconv) and LLVM 15.0.7 for iOS arm64, then one link test that
+# puts airconv + LLVM + DXMT's Metal bridge (with patches/dxmt) into a single iOS dylib.
+name: airconv-ios
+
+on:
+  push:
+    branches: [main]
+    paths: ["patches/dxmt/**", "tools/build/ios/build_airconv.sh", ".github/workflows/airconv-ios.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: airconv-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      OUT: ${{ github.workspace }}/build/ios-deps
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch DXMT and its DirectX headers
+        run: |
+          git submodule update --init --depth 1 external/dxmt
+          git -C external/dxmt submodule update --init --depth 1 include/native/directx
+          tools/apply_patches.sh dxmt
+      - run: brew install ninja
+      - name: Cache LLVM for iOS
+        id: llvm-cache
+        uses: actions/cache@v4
+        with:
+          path: build/ios-deps/llvm-ios
+          key: llvm-15.0.7-ios17-${{ hashFiles('tools/build/ios/build_airconv.sh') }}
+      - name: Build LLVM 15.0.7 for iOS
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: tools/build/ios/build_airconv.sh llvm
+      - name: Build airconv for iOS
+        run: tools/build/ios/build_airconv.sh airconv
+      - name: Link test (airconv + LLVM + winemetal for iOS)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd external/dxmt
+          for f in winemetal_unix cache; do
+            xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -ObjC -O1 \
+              -Iinclude -Isrc/airconv -Isrc/winemetal -Isrc/winemetal/unix \
+              -c src/winemetal/unix/$f.c -o /tmp/$f.o
+          done
+          # Library list: DXMT src/airconv/meson.build llvm_deps.
+          LLVM_LIBS="-lLLVMPasses -lLLVMTarget -lLLVMObjCARCOpts -lLLVMCoroutines -lLLVMipo -lLLVMInstrumentation \
+            -lLLVMVectorize -lLLVMLinker -lLLVMIRReader -lLLVMAsmParser -lLLVMFrontendOpenMP -lLLVMScalarOpts \
+            -lLLVMInstCombine -lLLVMAggressiveInstCombine -lLLVMTransformUtils -lLLVMBitWriter -lLLVMAnalysis \
+            -lLLVMProfileData -lLLVMSymbolize -lLLVMDebugInfoPDB -lLLVMDebugInfoMSF -lLLVMDebugInfoDWARF \
+            -lLLVMObject -lLLVMTextAPI -lLLVMMCParser -lLLVMMC -lLLVMDebugInfoCodeView -lLLVMBitReader \
+            -lLLVMCore -lLLVMRemarks -lLLVMBitstreamReader -lLLVMBinaryFormat -lLLVMSupport -lLLVMDemangle"
+          # shellcheck disable=SC2086
+          xcrun --sdk iphoneos clang++ -target arm64-apple-ios17.0 -isysroot "$SDK" -dynamiclib \
+            -install_name @rpath/winemetal.so -undefined dynamic_lookup \
+            -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
+            -framework CoreGraphics -framework UIKit -lsqlite3 \
+            /tmp/winemetal_unix.o /tmp/cache.o "$OUT/airconv/libairconv.a" \
+            -L"$OUT/llvm-ios/lib" $LLVM_LIBS -o /tmp/winemetal.so
+          ls -la /tmp/winemetal.so
+          echo "undefined symbols not provided by iOS system libraries:"
+          xcrun nm -u /tmp/winemetal.so > /tmp/undef.txt
+          SYS=$(xcrun --sdk iphoneos --show-sdk-path)/usr/lib
+          # Anything also undefined-but-resolvable from libSystem/frameworks is fine; list the rest
+          # by excluding common system prefixes; Wine's NtSetEvent is expected.
+          grep -vE '^(_objc_|__objc|_OBJC_|__Block|__NSConcrete|_dispatch_|__dispatch|_NS|_MTL|_CA|_CG|_kCG|_kCF|_CF|___CF|_sqlite3_|_os_|_mach_|__mach|_pthread_|_UI|_kUI|__Unwind|___cxa|___stack|___chk|___error|___assert|___stderrp|___stdoutp|__tlv|dyld_stub_binder|__ZN?St|__ZNSt|__ZdlPv|__Znwm|__ZdaPv|__Znam|___gxx|___cxx|_vm_|_task_|_sys_|___sincos)' /tmp/undef.txt \
+            | grep -vxE '_(abort|access|atexit|bzero|calloc|clock_gettime|close|confstr|dladdr|dlclose|dlerror|dlopen|dlsym|exit|_exit|fclose|fcntl|fflush|flock|fopen|fprintf|fputc|fputs|fread|free|fstat|fsync|ftruncate|fwrite|getcwd|getenv|getpagesize|getpid|getrlimit|getrusage|gettimeofday|getuid|isatty|kill|lseek|lstat|malloc|malloc_size|memchr|memcmp|memcpy|memmove|memset|mkdir|mkdtemp|mmap|mprotect|munmap|open|posix_spawn|posix_spawn_file_actions_.*|pread|printf|pthread_.*|putchar|puts|qsort|raise|read|readlink|realloc|realpath|remove|rename|rmdir|sigaction|sigaddset|sigemptyset|sigfillset|signal|sigprocmask|snprintf|sprintf|sscanf|stat|statfs|strcasecmp|strchr|strcmp|strcpy|strdup|strerror|strerror_r|strlen|strncmp|strncpy|strndup|strnlen|strrchr|strstr|strtod|strtol|strtoll|strtoul|strtoull|sysconf|sysctl|sysctlbyname|time|uname|unlink|usleep|vsnprintf|wait4|waitpid|write|writev|__.*_chk|_?NtSetEvent|SM50.*)' \
+            | tee /tmp/unexpected.txt || true
+          echo "count: $(wc -l < /tmp/unexpected.txt)"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airconv-ios
+          path: |
+            build/ios-deps/airconv/libairconv.a
+          retention-days: 7
