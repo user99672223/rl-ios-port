@@ -1,0 +1,13 @@
+# Game files and anything derived from them never leave this machine (spec section 2).
+/work/
+/out/
+
+# Build trees
+/build/
+/build-*/
+*.o
+*.obj
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
