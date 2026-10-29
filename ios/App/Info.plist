@@ -1,0 +1,105 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template. Build variables ($(...)) are filled by the Xcode build or by
+  tools/package_ipa.sh; the file is valid plist XML as-is and is checked with
+  Python's plistlib in tests/device/run.sh.
+
+  Each key below was checked against Apple's documentation (the Information
+  Property List pages under developer.apple.com/documentation/bundleresources):
+    UIFileSharingEnabled                                   iOS 3.2+, needed for ifuse (documents mode)
+    LSSupportsOpeningDocumentsInPlace                      iOS 2.0+ (per the docs page)
+    UIApplicationSceneManifest                             iOS 13+
+    UIWindowSceneSessionRoleApplication                    iOS 13+
+    UIWindowSceneSessionRoleExternalDisplayNonInteractive  iOS 16+
+    UISceneClassName / UISceneConfigurationName / UISceneDelegateClassName  iOS 13+
+    UIRequiresFullScreen                                   iOS 9+ (iPad multitasking opt-out; harmless on iPhone)
+    UISupportedInterfaceOrientations                       UIInterfaceOrientationLandscapeLeft / ...Right
+    GCSupportsControllerUserInteraction                    boolean
+  The scene delegate class names are placeholders owned by the ios/ app-shell agent.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(RLPORT_BUNDLE_ID)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundleDisplayName</key>
+	<string>RLPort</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>MinimumOSVersion</key>
+	<string>$(IPHONEOS_DEPLOYMENT_TARGET)</string>
+	<key>UIDeviceFamily</key>
+	<array>
+		<integer>1</integer>
+	</array>
+
+	<!-- Documents/ visible over USB (ifuse, documents mode) and in Files -->
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+
+	<!-- Scenes: phone screen plus a non-interactive external display scene -->
+	<key>UIApplicationSceneManifest</key>
+	<dict>
+		<key>UIApplicationSupportsMultipleScenes</key>
+		<true/>
+		<key>UISceneConfigurations</key>
+		<dict>
+			<key>UIWindowSceneSessionRoleApplication</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>Phone</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).PhoneSceneDelegate</string>
+				</dict>
+			</array>
+			<key>UIWindowSceneSessionRoleExternalDisplayNonInteractive</key>
+			<array>
+				<dict>
+					<key>UISceneClassName</key>
+					<string>UIWindowScene</string>
+					<key>UISceneConfigurationName</key>
+					<string>ExternalDisplay</string>
+					<key>UISceneDelegateClassName</key>
+					<string>$(PRODUCT_MODULE_NAME).ExternalDisplaySceneDelegate</string>
+				</dict>
+			</array>
+		</dict>
+	</dict>
+
+	<!-- Full screen, landscape only -->
+	<key>UIRequiresFullScreen</key>
+	<true/>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
+	<key>UIStatusBarHidden</key>
+	<true/>
+	<key>UIViewControllerBasedStatusBarAppearance</key>
+	<false/>
+
+	<!-- Game controllers -->
+	<key>GCSupportsControllerUserInteraction</key>
+	<true/>
+</dict>
+</plist>
