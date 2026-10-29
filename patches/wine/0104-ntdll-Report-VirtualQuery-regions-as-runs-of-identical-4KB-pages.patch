@@ -1,0 +1,35 @@
+From e8c97b15b45adc9212a864abad26066513243d9d Mon Sep 17 00:00:00 2001
+From: RLiOS prot4k <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 06:47:09 +0100
+Subject: [PATCH 5/6] ntdll: Report VirtualQuery regions as runs of identical 4
+ KB pages.
+
+get_vprot_range_size() compared whole protection bytes, so (a) the private native bit would split
+regions and (b) two uncommitted pages that remember different protections (for example after a
+VirtualProtect followed by MEM_DECOMMIT) were reported as two reserved regions, where Windows
+reports one. Mask the native bit out and compare uncommitted pages by their committed state only.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 6b8942e..e3f6d47 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -1190,6 +1190,11 @@ static SIZE_T get_vprot_range_size( char *base, SIZE_T size, BYTE mask, BYTE *vp
+ #endif
+     *vprot = *vprot_ptr;
+ 
++    /* The native bit is not visible to Windows, and an uncommitted page has no protection: a run
++     * of uncommitted pages is one region whatever protection bits the pages remember. */
++    mask &= ~VPROT_NATIVE;
++    if ((mask & VPROT_COMMITTED) && !(*vprot & VPROT_COMMITTED)) mask = VPROT_COMMITTED;
++
+     /* Page count page table is at least the multiples of sizeof(UINT_PTR)
+      * so we don't have to worry about crossing the boundary on unaligned idx values. */
+ 
+-- 
+2.47.3
+

@@ -1,0 +1,275 @@
+From e6c396770e73a81cf8295af2ec6171b59cac25b8 Mon Sep 17 00:00:00 2001
+From: RLiOS prot4k <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 06:45:39 +0100
+Subject: [PATCH 2/6] ntdll: Compute host page protections with prot4k and make
+ image protections two-pass everywhere.
+
+mprotect_range() and get_unix_prot() now go through the prot4k library. With the default
+(empty) policy on Linux the result is identical to the existing union of the per-4KB
+protection bytes. On Apple silicon the default policy is "ios": emulated (non native) pages
+get no host X and the host never sees W+X, and WINE_PROT4K overrides it (none, dropx, wx,
+softguard, softww, ios).
+
+The PE section protections are recorded for all sections before any mprotect, on every host,
+not only on __APPLE__: the host protection of a 16 KB page is then computed from the final
+4 KB protections and no intermediate state is ever applied. A section that is writable but
+not readable is made readable as well, since write implies read.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 167 ++++++++++++++++++++++++--------------
+ 1 file changed, 105 insertions(+), 62 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index a12c172..f8ad5de 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -90,6 +90,7 @@
+ #include "wine/rbtree.h"
+ #include "unix_private.h"
+ #include "wine/debug.h"
++#include "prot4k.h"
+ 
+ WINE_DEFAULT_DEBUG_CHANNEL(virtual);
+ WINE_DECLARE_DEBUG_CHANNEL(module);
+@@ -138,6 +139,11 @@ struct file_view
+ #define VPROT_GUARD      0x10
+ #define VPROT_COMMITTED  0x20
+ #define VPROT_WRITEWATCH 0x40
++/* the per-page bytes are shared with the prot4k library (4 KB protections over larger host pages) */
++C_ASSERT( VPROT_READ == P4K_READ && VPROT_WRITE == P4K_WRITE && VPROT_EXEC == P4K_EXEC );
++C_ASSERT( VPROT_WRITECOPY == P4K_WRITECOPY && VPROT_GUARD == P4K_GUARD );
++C_ASSERT( VPROT_COMMITTED == P4K_COMMITTED && VPROT_WRITEWATCH == P4K_WRITEWATCH );
++C_ASSERT( PROT_READ == P4K_HOST_READ && PROT_WRITE == P4K_HOST_WRITE && PROT_EXEC == P4K_HOST_EXEC );
+ /* per-mapping protection flags */
+ #define VPROT_ARM64EC          0x0100  /* view may contain ARM64EC code */
+ #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
+@@ -250,6 +256,10 @@ static void *preload_reserve_end;
+ static BOOL force_exec_prot;  /* whether to force PROT_EXEC on all PROT_READ mmaps */
+ static BOOL enable_write_exceptions;  /* raise exception on writes to executable memory */
+ 
++/* How the 4 KB Windows page protections are mapped onto host pages, see prot4k.h.
++ * With an empty policy this is exactly the stock behaviour. The policy is chosen in virtual_init(). */
++static p4k_policy prot4k_policy = { 0x1000, 0 };
++
+ struct range_entry
+ {
+     void *base;
+@@ -1380,15 +1390,8 @@ static const char *get_prot_str( BYTE prot )
+  */
+ static int get_unix_prot( BYTE vprot )
+ {
+-    int prot = 0;
+-    if ((vprot & VPROT_COMMITTED) && !(vprot & VPROT_GUARD))
+-    {
+-        if (vprot & VPROT_READ) prot |= PROT_READ;
+-        if (vprot & VPROT_WRITE) prot |= PROT_WRITE | PROT_READ;
+-        if (vprot & VPROT_WRITECOPY) prot |= PROT_WRITE | PROT_READ;
+-        if (vprot & VPROT_EXEC) prot |= PROT_EXEC | PROT_READ;
+-        if (vprot & VPROT_WRITEWATCH) prot &= ~PROT_WRITE;
+-    }
++    int prot = p4k_part_prot( vprot, prot4k_policy.flags );
++    if (vprot & VPROT_WRITEWATCH && !(prot4k_policy.flags & P4K_POLICY_SOFT_WRITEWATCH)) prot &= ~PROT_WRITE;
+     if (!prot) prot = PROT_NONE;
+     return prot;
+ }
+@@ -1971,28 +1974,38 @@ static inline int mprotect_exec( void *base, size_t size, int unix_prot )
+  *
+  * Call mprotect on a page range, applying the protections from the per-page byte.
+  */
+-static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
++static uint8_t prot4k_get_part( void *ud, uintptr_t page )
+ {
+-    size_t i, count;
+-    char *addr = ROUND_ADDR( base, host_page_mask );
+-    int prot, next;
+-    BYTE vprot;
++    return get_page_vprot( (const void *)(page << page_shift) );
++}
+ 
+-    size = ROUND_SIZE( base, size, host_page_mask );
++static int prot4k_host_mprotect( void *ud, uintptr_t addr, size_t len, int prot )
++{
++    /* when guest code is not run natively there is nothing to force exec on */
++    if (prot4k_policy.flags & P4K_POLICY_DROP_GUEST_X) return mprotect( (void *)addr, len, prot );
++    return mprotect_exec( (void *)addr, len, prot );
++}
+ 
+-    vprot = get_host_page_vprot( addr );
+-    prot = get_unix_prot( (vprot & ~clear) | set );
+-    for (count = i = 1; i < size / host_page_size; i++, count++)
+-    {
+-        vprot = get_host_page_vprot( addr + count * host_page_size );
+-        next = get_unix_prot( (vprot & ~clear) | set );
+-        if (next == prot) continue;
+-        if (mprotect_exec( addr, count * host_page_size, prot )) return -1;
+-        addr += count * host_page_size;
+-        prot = next;
+-        count = 0;
+-    }
+-    return mprotect_exec( addr, count * host_page_size, prot );
++static int prot4k_host_zero( void *ud, uintptr_t addr, size_t len )
++{
++    memset( (void *)addr, 0, len );
++    return 0;
++}
++
++static void prot4k_host_conflict( void *ud, uintptr_t addr )
++{
++    static int count;
++
++    if (count++ < 16)
++        ERR( "W^X: native code shares host page %p with writable pages, X dropped there\n", (void *)addr );
++}
++
++static const p4k_host_ops prot4k_host = { prot4k_host_mprotect, prot4k_host_zero, NULL, prot4k_host_conflict };
++
++static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
++{
++    return p4k_apply_range( &prot4k_policy, prot4k_get_part, NULL, &prot4k_host,
++                            (uintptr_t)base, size, set, clear );
+ }
+ 
+ 
+@@ -3274,23 +3287,19 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+ 
+     /* set the image protections */
+ 
+-#ifdef __APPLE__
+     /* First track all the section protections, then apply them. This ensures
+      * that on hosts with a page size larger than the Windows one, the union
+      * of protections within a host page is computed from the final values, so
+      * that an executable page is never also writable (which macOS ARM64
+      * rejects with W^X enforcement).
+      *
+-     * Note that this only works when executable and writable sections do not
+-     * share a host page, i.e. when the image section alignment is at least the
+-     * host page size (16KB on Apple Silicon). ARM64 Windows binaries are
+-     * required to use such an alignment. A PE whose executable and writable
+-     * sections land in the same host page would need an executable and
+-     * writable page at once, which macOS W^X enforcement refuses; the only
+-     * alternative would be to toggle the page between RX and RW on every
+-     * access, which is unusable since a writable data section is written
+-     * continuously while the code on the same page runs. Such binaries simply
+-     * cannot be loaded on this platform. */
++     * Native ARM64 images have sections aligned to the host page size, so the
++     * executable and writable sections never share a host page. x86-64 images
++     * (4 KB section alignment) do share host pages, but their code is never
++     * executed natively: with the prot4k drop-X policy those pages get no
++     * host X and the union is R or RW, see prot4k.h. Without that policy a
++     * host page that needs to be both executable and writable is refused by
++     * macOS W^X enforcement, and the image cannot be loaded. */
+     set_vprot_track( view, ptr, ROUND_SIZE( 0, header_size, align_mask ), VPROT_COMMITTED | VPROT_READ );
+     for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+     {
+@@ -3303,7 +3312,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+             size = ROUND_SIZE( sec[i].VirtualAddress, sec[i].SizeOfRawData, align_mask );
+ 
+         if (sec[i].Characteristics & IMAGE_SCN_MEM_READ)    vprot |= VPROT_READ;
+-        if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY;
++        if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY | VPROT_READ;  /* write implies read */
+         if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
+ 
+         set_vprot_track( view, ptr + sec[i].VirtualAddress, size, vprot );
+@@ -3323,28 +3332,6 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+             ERR( "failed to set %08x protection on %s section %.8s, noexec filesystem?\n",
+                  sec[i].Characteristics, debugstr_us(nt_name), sec[i].Name );
+     }
+-#else
+-    set_vprot( view, ptr, ROUND_SIZE( 0, header_size, align_mask ), VPROT_COMMITTED | VPROT_READ );
+-
+-    for (i = 0; i < nt->FileHeader.NumberOfSections; i++)
+-    {
+-        SIZE_T size;
+-        BYTE vprot = VPROT_COMMITTED;
+-
+-        if (sec[i].Misc.VirtualSize)
+-            size = ROUND_SIZE( sec[i].VirtualAddress, sec[i].Misc.VirtualSize, align_mask );
+-        else
+-            size = ROUND_SIZE( sec[i].VirtualAddress, sec[i].SizeOfRawData, align_mask );
+-
+-        if (sec[i].Characteristics & IMAGE_SCN_MEM_READ)    vprot |= VPROT_READ;
+-        if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE)   vprot |= VPROT_WRITECOPY;
+-        if (sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE) vprot |= VPROT_EXEC;
+-
+-        if (!set_vprot( view, ptr + sec[i].VirtualAddress, size, vprot ) && (vprot & VPROT_EXEC))
+-            ERR( "failed to set %08x protection on %s section %.8s, noexec filesystem?\n",
+-                 sec[i].Characteristics, debugstr_us(nt_name), sec[i].Name );
+-    }
+-#endif
+ 
+ #ifdef VALGRIND_LOAD_PDB_DEBUGINFO
+     VALGRIND_LOAD_PDB_DEBUGINFO(fd, ptr, total_size, ptr - (char *)wine_server_get_ptr( image_info->base ));
+@@ -3738,6 +3725,61 @@ static void *alloc_virtual_heap( SIZE_T size )
+     return anon_mmap_alloc( size, PROT_READ | PROT_WRITE );
+ }
+ 
++/***********************************************************************
++ *           prot4k_init
++ *
++ * Choose how the 4 KB Windows page protections are applied to host pages.
++ * Default on Apple silicon: emulated x86 code never needs host X, W^X is enforced, and
++ * guard pages / write watches are tracked in software only (no deliberate faults, so a
++ * debugger attached for JIT never sees them). Elsewhere the default is the stock
++ * behaviour. WINE_PROT4K overrides it with a comma separated list of
++ *   none, dropx, wx, softguard, softww, ios (= dropx,wx,softguard,softww)
++ */
++static void prot4k_init(void)
++{
++    static const struct { const char *name; unsigned int flags; } names[] =
++    {
++        { "none", 0 },
++        { "dropx", P4K_POLICY_DROP_GUEST_X },
++        { "wx", P4K_POLICY_ENFORCE_WX },
++        { "softguard", P4K_POLICY_SOFT_GUARD },
++        { "softww", P4K_POLICY_SOFT_WRITEWATCH },
++        { "ios", P4K_POLICY_DROP_GUEST_X | P4K_POLICY_ENFORCE_WX | P4K_POLICY_SOFT_GUARD | P4K_POLICY_SOFT_WRITEWATCH },
++    };
++    const char *env = getenv( "WINE_PROT4K" );
++    unsigned int flags = 0;
++
++#if defined(__APPLE__) && defined(__aarch64__)
++    flags = P4K_POLICY_DROP_GUEST_X | P4K_POLICY_ENFORCE_WX | P4K_POLICY_SOFT_GUARD | P4K_POLICY_SOFT_WRITEWATCH;
++#endif
++    if (env)
++    {
++        flags = 0;
++        while (*env)
++        {
++            size_t len = strcspn( env, "," );
++            unsigned int i;
++
++            for (i = 0; i < ARRAY_SIZE(names); i++)
++                if (strlen( names[i].name ) == len && !strncmp( env, names[i].name, len )) break;
++            if (i < ARRAY_SIZE(names)) flags |= names[i].flags;
++            else WARN( "unknown WINE_PROT4K option %.*s\n", (int)len, env );
++            env += len;
++            if (*env == ',') env++;
++        }
++    }
++    prot4k_policy.host_page_size = host_page_size;
++    prot4k_policy.flags = flags;
++    if (p4k_policy_check( &prot4k_policy ))
++    {
++        ERR( "unsupported host page size %#lx, 4 KB page protection layer disabled\n", (long)host_page_size );
++        prot4k_policy.host_page_size = 0x1000;
++        prot4k_policy.flags = 0;
++    }
++    TRACE( "prot4k: host page %luk flags %#x\n", (unsigned long)(prot4k_policy.host_page_size / 1024), prot4k_policy.flags );
++}
++
++
+ /***********************************************************************
+  *           virtual_init
+  */
+@@ -3759,6 +3801,7 @@ void virtual_init(void)
+     host_page_mask = host_page_size - 1;
+     TRACE( "host page size: %uk\n", (UINT)host_page_size / 1024 );
+ #endif
++    prot4k_init();
+ 
+ #ifdef _WIN64
+     host_addr_space_limit = get_host_addr_space_limit();
+-- 
+2.47.3
+
