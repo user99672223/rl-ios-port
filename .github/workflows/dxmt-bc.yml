@@ -1,0 +1,159 @@
+# DXMT BC1-BC7 emulation on Metal devices without BC support (patches/dxmt/01xx).
+# Toolchain recipe is DXMT's own: external/dxmt/.github/workflows/ci.yml (x86_64 cross build:
+# Wine v8.16-3shain, llvm-mingw, LLVM 15.0.7 built for Darwin x86_64, meson 1.10.0).
+name: dxmt-bc
+
+on:
+  push:
+    branches: [wip/dxmt-bc]
+  workflow_dispatch:
+
+env:
+  LLVM_VERSION: llvmorg-15.0.7
+  WINE_VERSION: v8.16-3shain
+  WINE_URL: https://github.com/3Shain/wine/releases/download/v8.16-3shain/wine.tar.gz
+  LLVM_MINGW_VERSION: "20251216"
+  LLVM_MINGW_DIR: llvm-mingw-20251216-ucrt-macos-universal
+
+jobs:
+  setup-wine:
+    runs-on: macos-15
+    steps:
+      - name: Cache Wine
+        id: cache
+        uses: actions/cache@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+      - name: Install Wine
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains/wine
+          curl -fSL ${{ env.WINE_URL }} > ./wine.tar.gz
+          tar -zxf ./wine.tar.gz -C ./toolchains/wine
+          rm ./wine.tar.gz
+      - name: Layout
+        run: ls ./toolchains/wine ./toolchains/wine/bin ./toolchains/wine/lib/wine | head -60
+
+  setup-llvm-mingw:
+    runs-on: macos-15
+    steps:
+      - name: Cache LLVM-MinGW
+        id: cache
+        uses: actions/cache@v5
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-macos
+          path: ./toolchains/${{ env.LLVM_MINGW_DIR }}
+      - name: Install LLVM-MinGW
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL https://github.com/mstorsjo/llvm-mingw/releases/download/${{ env.LLVM_MINGW_VERSION }}/${{ env.LLVM_MINGW_DIR }}.tar.xz > ./llvm.tar.xz
+          mkdir -p ./toolchains
+          tar -xf ./llvm.tar.xz -C ./toolchains
+          rm ./llvm.tar.xz
+
+  # LLVM 15 libraries for Darwin x86_64 (airconv links them into winemetal.so). Slow; cached.
+  # The job-level concurrency group makes a second run wait instead of building it twice.
+  setup-llvm-darwin:
+    runs-on: macos-15
+    concurrency:
+      group: dxmt-bc-llvm-darwin
+      cancel-in-progress: false
+    steps:
+      - name: Cache LLVM Darwin Build
+        id: cache
+        uses: actions/cache@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+      - name: Clone LLVM Project
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: git clone --depth 1 --branch ${{ env.LLVM_VERSION }} https://github.com/llvm/llvm-project.git toolchains/llvm-project
+      - name: Build LLVM for Darwin (x86_64)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ./toolchains/llvm-darwin-build
+          cmake -B ./toolchains/llvm-darwin-build -S ./toolchains/llvm-project/llvm \
+            -DCMAKE_INSTALL_PREFIX="$(pwd)/toolchains/llvm-darwin" \
+            -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+            -DLLVM_HOST_TRIPLE=x86_64-apple-darwin \
+            -DLLVM_ENABLE_ASSERTIONS=On \
+            -DLLVM_ENABLE_ZSTD=Off \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=Off \
+            -DBUG_REPORT_URL="https://github.com/3Shain/dxmt" \
+            -DPACKAGE_VENDOR="DXMT" \
+            -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off \
+            -G Ninja
+          cmake --build ./toolchains/llvm-darwin-build
+          cmake --install ./toolchains/llvm-darwin-build
+      - name: Remove build tree
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: rm -rf toolchains/llvm-darwin-build toolchains/llvm-project
+
+  # What does a hosted macos-15 runner give us? (Metal device, BC support, Rosetta, Wine)
+  probe:
+    runs-on: macos-15
+    needs: [setup-wine]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Restore Wine
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+          fail-on-cache-miss: true
+      - name: System
+        run: |
+          uname -a; sw_vers; sysctl -n machdep.cpu.brand_string; sysctl hw.ncpu hw.memsize
+          ls /Applications | grep -i xcode || true
+          xcode-select -p
+          system_profiler SPDisplaysDataType || true
+      - name: Metal device probe
+        run: |
+          cat > /tmp/probe.m <<'EOF'
+          #import <Metal/Metal.h>
+          #import <Foundation/Foundation.h>
+          int main(void) {
+            @autoreleasepool {
+              NSArray<id<MTLDevice>> *devs = MTLCopyAllDevices();
+              printf("PROBE devices: %lu\n", (unsigned long)devs.count);
+              id<MTLDevice> d = MTLCreateSystemDefaultDevice();
+              printf("PROBE default: %s\n", d ? d.name.UTF8String : "(null)");
+              for (id<MTLDevice> dev in devs) {
+                printf("PROBE device %s lowPower=%d headless=%d unified=%d\n", dev.name.UTF8String, dev.isLowPower, dev.isHeadless, dev.hasUnifiedMemory);
+                printf("PROBE supportsBCTextureCompression=%d\n", dev.supportsBCTextureCompression);
+                printf("PROBE families: apple1..9 =");
+                for (int f = 1001; f <= 1009; f++) printf(" %d", [dev supportsFamily:(MTLGPUFamily)f]);
+                printf("\nPROBE mac2=%d common3=%d metal3=%d\n", [dev supportsFamily:MTLGPUFamilyMac2], [dev supportsFamily:MTLGPUFamilyCommon3], [dev supportsFamily:MTLGPUFamilyMetal3]);
+                printf("PROBE argumentBuffersSupport=%lu\n", (unsigned long)dev.argumentBuffersSupport);
+                printf("PROBE maxBufferLength=%llu recommendedMaxWorkingSet=%llu\n", (unsigned long long)dev.maxBufferLength, (unsigned long long)dev.recommendedMaxWorkingSetSize);
+                // ASTC and BC texture creation
+                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_6x6_LDR width:64 height:64 mipmapped:NO];
+                printf("PROBE ASTC_6x6_LDR texture: %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
+                td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_HDR width:64 height:64 mipmapped:NO];
+                printf("PROBE ASTC_4x4_HDR texture: %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
+                td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC7_RGBAUnorm width:64 height:64 mipmapped:NO];
+                printf("PROBE BC7 texture: %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
+              }
+            }
+            return 0;
+          }
+          EOF
+          clang -fobjc-arc -o /tmp/probe /tmp/probe.m -framework Metal -framework Foundation
+          /tmp/probe
+          echo "--- x86_64 (Rosetta)"
+          clang -fobjc-arc -arch x86_64 -o /tmp/probe_x86 /tmp/probe.m -framework Metal -framework Foundation
+          /tmp/probe_x86 || echo "x86_64 run failed (Rosetta missing?)"
+      - name: Rosetta
+        run: |
+          arch -x86_64 /usr/bin/true && echo "rosetta ok" || { sudo softwareupdate --install-rosetta --agree-to-license; arch -x86_64 /usr/bin/true && echo "rosetta installed"; }
+      - name: Wine smoke
+        run: |
+          export PATH="$PWD/toolchains/wine/bin:$PATH"
+          ls toolchains/wine/bin | head -30
+          file toolchains/wine/bin/wine64 || file toolchains/wine/bin/wine || true
+          export WINEPREFIX=$PWD/prefix WINEDEBUG=-all
+          (timeout 600 wine64 wineboot -i || timeout 600 wine wineboot -i) 2>&1 | tail -20
+          timeout 120 wine64 cmd /c echo hello-from-wine 2>&1 | tail -5
