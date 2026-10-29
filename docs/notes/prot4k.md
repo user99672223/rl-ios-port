@@ -280,14 +280,49 @@ default is not wanted (`none,dropx,wx,softguard,softww,ios`).
 
 ## 7. Verified and not verified
 
-Verified here: library and tests (above); the patches apply in sequence to the pinned tree; the patched
-`ntdll.so` compiles for x86-64 Linux and `virtual.c` and `prot4k.c` compile for aarch64-linux (16 KB code
-paths included, no warnings); a patched Wine with a *simulated* 16 KB host page (scratch-only hook, see
-the final report) runs `vm4k.exe`.
+Verified (this Debian x86-64 host, 4 KB kernel pages):
+- Library and tests (section 6): `make -C tests/prot4k` passes; `make -C tests/prot4k negative` shows all
+  16 deliberate breaks failing and the pristine library passing again. The union logic was also broken
+  in place once (`|=` turned into `&=`), which failed 75 unit checks and the random test, and was restored
+  byte-identical.
+- Patches 0100-0105 apply in sequence to the pinned tree (check-only apply, then apply, on a copy of
+  `external/wine`; the touched files are byte-identical to the submodule's).
+- Patched `ntdll.so` builds for x86-64 Linux with `./configure --enable-win64 --without-x ...` and a full
+  `make` (no warnings in `prot4k.c` / `virtual.c`); `virtual.c` and `prot4k.c` also compile for
+  aarch64-linux with `aarch64-linux-gnu-gcc` (`__aarch64__` code paths included, no warnings).
+- **Real Wine with a simulated 16 KB host page.** Scratch-only hook (not a deliverable, not in the
+  patches): the host page size is taken from `WINE_FAKE_HOST_PAGE=16384` on x86-64, so every
+  `mmap`/`mprotect` Wine issues is 16 KB aligned, which the 4 KB kernel accepts; plus shrinking the
+  x86-64 preloader's reserved areas to 16 KB, one `mmap` in `signal_x86_64.c:2814` (the syscall thunk page
+  next to the shared user data) and `WINE_NO_UFFD` to switch off kernel write watches. `vm4k.exe`
+  (288 checks) results:
 
-Not verified: any run on Apple silicon, macOS, or iOS; the `__APPLE__` default (compiles only on a Mac);
-interaction with FEX's ARM64EC emulator and with the JIT region; ARM64EC bitmap classification (code
-read, never executed); `WINE_PROT4K` plumbing from the app.
+  | ntdll | host page | result |
+  |---|---|---|
+  | stock MR 11638 | 4 KB | pass (control) |
+  | stock MR 11638 | simulated 16 KB | **fails**: bytes written before a partial `MEM_DECOMMIT` reappear after `MEM_COMMIT` (gap 3 of section 2); a whole-view decommit of a 12 KB allocation aborts on `anon_mmap_fixed`'s alignment `assert` (gap 4) |
+  | patched 0100-0105 | 4 KB | pass |
+  | patched, `WINE_PROT4K=none` | simulated 16 KB | pass; write watch fault-armed (0 pages before any write, whole 16 KB host pages after) |
+  | patched, `softguard,softww` | simulated 16 KB | pass; write watch conservative (8 of 8 pages from the start) |
+
+  This exercises the two-pass image mapping of every DLL Wine loads (the mingw DLLs have 4 KB aligned
+  sections, so RX / R / RW parts really share 16 KB host pages), `mprotect_range`, the new decommit path,
+  query coalescing and the soft modes, in real Wine flows. It cannot exercise `dropx`/`wx` (x86-64
+  Wine would stop executing its own code) or any of the Apple-only code.
+
+Not verified: any run on Apple silicon, macOS or iOS; the `__APPLE__ && __aarch64__` default policy
+(compiles only on a Mac); `dropx` with real ARM64EC modules (the native-page classification is read from
+source: EC bitmap, ARM64 images, builtin views); interaction with FEX's ARM64EC emulator and with the
+JIT region; `WINE_PROT4K` plumbing from the app; performance (`mprotect` count).
+
+Side findings for other agents:
+- The pinned tree predates upstream `6488dddf` "preloader: Round WINEPRELOADRESERVE values to the
+  granularity boundary" and `0cd4e6c5` "Align reserved areas to the allocation granularity" (both
+  2026-10-06). Reserved areas that are only 4 KB aligned trip `mmap_add_reserved_area`'s asserts
+  (`virtual.c:451-452`) on a larger host page. The iOS port has no preloader, but whoever lays out the
+  address space (spec 6.3, "Address space") must keep every reserved area host-page aligned.
+- `signal_x86_64.c:553/2814` maps a 4 KB page right after the shared user data; irrelevant for ARM64
+  hosts, listed because it is the first 4 KB-granular assumption an x86-64 build hits.
 
 ## 8. Proposed DECISIONS entries
 

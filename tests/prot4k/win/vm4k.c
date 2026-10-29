@@ -71,7 +71,7 @@ static void test_regions( void )
     /* protecting a range that includes a reserved page fails and changes nothing */
     SetLastError( 0 );
     CHECK( !VirtualProtect( p + 0x2000, 0x2000, PAGE_READONLY, &old ) );
-    CHECK_EQ( GetLastError(), ERROR_NOACCESS );          /* STATUS_NOT_COMMITTED -> ERROR_NOACCESS */
+    CHECK_EQ( GetLastError(), ERROR_INVALID_ADDRESS );   /* STATUS_NOT_COMMITTED */
     m = q( p + 0x2000 ); CHECK_EQ( m.Protect, PAGE_READWRITE );
 
     /* a whole 16 KB worth of single-page protections cycled through every kind */
@@ -85,12 +85,13 @@ static void test_regions( void )
             CHECK( VirtualProtect( p + 0x3000 + i * 0x1000, 0x1000, want, &old ) );
             m = q( p + 0x3000 + i * 0x1000 );
             CHECK_EQ( m.Protect, want );
-            CHECK_EQ( m.RegionSize, 0x1000 );
+            CHECK_EQ( m.BaseAddress, p + 0x3000 + i * 0x1000 - (i && prots[(i - 1) % 6] == want ? 0x1000 : 0) );
         }
         for (i = 0; i < 9; i++)
         {
             m = q( p + 0x3000 + i * 0x1000 );
             CHECK_EQ( m.Protect, prots[i % 6] );         /* earlier pages unaffected by later changes */
+            CHECK_EQ( m.RegionSize, 0x1000 );            /* all neighbours differ: exactly one 4 KB page each */
         }
     }
     CHECK( VirtualFree( p + 0x1000, 0, MEM_RELEASE ) == 0 );        /* not the allocation base */
@@ -171,6 +172,11 @@ static void test_guard_and_watch( void )
     p = VirtualAlloc( NULL, 0x8000, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE );
     CHECK( p != NULL );
     if (!p) return;
+    count = 64;
+    rc = GetWriteWatch( 0, p, 0x8000, pages, &count, &gran );
+    CHECK_EQ( rc, 0 );
+    printf( "  write watch before any write: %lu of 8 pages reported (0 = armed by faults, 8 = conservative / no-fault)\n",
+            (unsigned long)count );
     p[0x2000] = 1; p[0x5000] = 2;
     count = 64;
     rc = GetWriteWatch( 0, p, 0x8000, pages, &count, &gran );
@@ -185,7 +191,7 @@ static void test_guard_and_watch( void )
             if (pages[i] == p + 0x5000) saw5 = 1;
         }
         CHECK( saw2 && saw5 );                      /* never miss a written page */
-        printf( "  write watch reported %lu of 8 pages as written (8 = conservative / no-fault mode)\n", (unsigned long)count );
+        printf( "  write watch after two writes: %lu of 8 pages reported\n", (unsigned long)count );
     }
     VirtualFree( p, 0, MEM_RELEASE );
 }
