@@ -13,6 +13,11 @@ on:
         description: Differential cases per seed
         default: "1000"
 
+# A newer push makes older runs on the same ref pointless; each one builds FEX from scratch.
+concurrency:
+  group: linux-arm64-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   diff-cases:
     name: Generate differential cases (native x86-64)

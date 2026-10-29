@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__APPLE__)
+#include <libkern/OSCacheControl.h>
+#endif
 
 #define MAX_RANGES 4096
 
@@ -208,9 +211,13 @@ out:
 }
 
 void jit_flush(void* rx, size_t len) {
-  // Clang lowers this to sys_icache_invalidate on Darwin and to the libgcc/compiler-rt helper
-  // elsewhere; no platform header needed.
+#if defined(__APPLE__)
+  // On Darwin __builtin___clear_cache emits a call to __clear_cache, which is not linked on
+  // iOS (found by runtime-ios-compile.yml); the system call is sys_icache_invalidate.
+  sys_icache_invalidate(rx, len);
+#else
   __builtin___clear_cache((char*)rx, (char*)rx + len);
+#endif
 }
 
 size_t jit_region_size(void) {
