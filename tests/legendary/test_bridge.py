@@ -110,7 +110,7 @@ def test_launch_args_d005(bridge, cfg, game_dir, write_state, FakeEPCAPI):
     assert r["game_dir"] == str(game_dir)
     assert not any(a.lower().endswith("wine") for a in r["argv"])  # no wine wrapper
 
-    # the auth arguments Legendary generates (core.py:897-914), in Legendary's order
+    # the auth arguments Legendary generates (core.py:899-925), in Legendary's order
     for expected in LEGENDARY_ORDER:
         assert expected in r["argv"]
     idx = [r["argv"].index(a) for a in LEGENDARY_ORDER]
