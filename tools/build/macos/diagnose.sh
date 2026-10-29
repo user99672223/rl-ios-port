@@ -19,6 +19,11 @@ done
 echo "DIAG ---- otool -L bin/wine"; otool -L "$bin/wine" | sed -e 's/^/DIAG   /'
 echo "DIAG ---- load commands of bin/wine (segments)"; otool -l "$bin/wine" | grep -E "segname|vmaddr|vmsize|cmd LC_(MAIN|LOAD_DYLIB|CODE_SIGNATURE|DYLD_CHAINED)" | head -40 | sed -e 's/^/DIAG   /'
 
+echo "DIAG ---- the exec'd loader image"
+for f in "$unixdir/wine"; do
+  file "$f" | sed -e 's/^/DIAG   /'; otool -l "$f" | grep -E "segname|vmaddr|vmsize|fileoff|filesize|minos|sdk|cmd LC_(BUILD|SEGMENT)" | head -50 | sed -e 's/^/DIAG   /'
+  rc=0; "$f" > /dev/null 2>&1 || rc=$?; echo "DIAG   direct exec of $f: exit status $rc"
+done
 echo "DIAG ---- run with loader tracing"
 rc=0
 WINEDEBUG=+loaddll,+process,+module,+virtual,+seh run_timeout 120 wine "$exe" 2>&1 | head -80 | sed -e 's/^/DIAG   /' || rc=$?

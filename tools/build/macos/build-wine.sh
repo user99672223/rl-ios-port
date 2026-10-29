@@ -81,4 +81,22 @@ fi
 group "make install"
 make install 2>&1 | tail -5 | tee "$LOG_DIR/wine-install.log"
 endgroup
+
+# x18 (the Windows ARM64 TEB register): xnu zeroes it on every context switch / signal return unless the task is
+# entitled (com.apple.private.custom-x18-abi / com.apple.private.uexc) or is a macOS binary whose LC_BUILD_VERSION
+# SDK version is < 13.0 -- xnu-11417.140.69 osfmk/arm64/machine_task.c:319-333, osfmk/arm64/locore.s:1498-1514.
+# The deployment target (-mmacosx-version-min=12, which MR 11638 passes) is the *minos* field and does not count;
+# the *sdk* field does. The task is re-signed at every exec(), and bin/wine execs lib/wine/<arch>-unix/wine
+# (reexec_loader, dlls/ntdll/unix/loader.c:2039-2063), so the final loader is the one that matters.
+if [ "$IS_DARWIN" = 1 ] && [ "${WINE_X18_SDK12:-1}" = 1 ]; then
+  group "set LC_BUILD_VERSION sdk=12.0 on the loader executables (keeps x18 alive, see comment)"
+  for f in "$WINE_PREFIX_DIR"/bin/wine "$WINE_PREFIX_DIR"/lib/wine/*-unix/wine "$WINE_PREFIX_DIR"/bin/wineserver; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    vtool -set-build-version macos 12.0 12.0 -replace -output "$f.vtool" "$f"
+    mv "$f.vtool" "$f"
+    codesign -s - --force "$f"
+    echo "$f: $(otool -l "$f" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk' | tr -s ' ' | tr '\n' ' ')"
+  done
+  endgroup
+fi
 ls "$WINE_PREFIX_DIR/bin" "$WINE_PREFIX_DIR/lib/wine" | head -40

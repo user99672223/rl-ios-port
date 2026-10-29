@@ -21,9 +21,22 @@ echo "PROBE ---- does x18 survive depending on the binary's deployment target? (
 for v in 11.0 12.0 13.0 14.0 15.0; do
   clang -O1 -mmacosx-version-min=$v -o "$dir/probe-x18-$v" "$MACOS_TOOLS_DIR/probe/probe.c" 2>&1 | head -2
   codesign -s - --force "$dir/probe-x18-$v" 2>/dev/null || true
-  echo "PROBE minos=$v: $(otool -l "$dir/probe-x18-$v" | grep -A2 LC_BUILD_VERSION | grep minos | tr -s ' ')"
+  echo "PROBE minos=$v: $(otool -l "$dir/probe-x18-$v" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk' | tr -s ' ')"
   "$dir/probe-x18-$v" x18 | grep -E "x18_(after_signal_return|after_sleep|preemption)" | sed -e "s/^PROBE /PROBE minos=$v /"
 done
+
+echo "PROBE ---- x18 and the SDK version recorded in LC_BUILD_VERSION (xnu-11417.140.69 osfmk/arm64/machine_task.c:331: preserved only if platform==macOS and sdk < 13.0, or entitled)"
+for v in 12.0 13.0; do
+  clang -O1 -o "$dir/probe-sdk-$v" "$MACOS_TOOLS_DIR/probe/probe.c" -Wl,-platform_version,macos,$v,$v 2>&1 | head -3
+  codesign -s - --force "$dir/probe-sdk-$v" 2>/dev/null || true
+  echo "PROBE ld -platform_version macos $v $v: $(otool -l "$dir/probe-sdk-$v" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk' | tr -s ' ' | tr '\n' ' ')"
+  "$dir/probe-sdk-$v" x18 | grep -E "x18_(after_signal_return|after_sleep|preemption)" | sed -e "s/^PROBE /PROBE sdk=$v /"
+done
+# Rewriting an already linked binary (what build-wine.sh does to bin/wine and bin/wineserver):
+vtool -set-build-version macos 12.0 12.0 -replace -output "$dir/probe-vtool" "$dir/probe" 2>&1 | head -3
+codesign -s - --force "$dir/probe-vtool" 2>/dev/null || true
+echo "PROBE vtool -set-build-version macos 12.0 12.0: $(otool -l "$dir/probe-vtool" | grep -A4 LC_BUILD_VERSION | grep -E 'minos|sdk' | tr -s ' ' | tr '\n' ' ')"
+"$dir/probe-vtool" x18 | grep -E "x18_(after_signal_return|after_sleep|preemption)" | sed -e "s/^PROBE /PROBE vtool-sdk12 /"
 
 echo "PROBE ---- W+X mmap with a debugger attached (stand-in for the StikDebug / CS_DEBUGGED case) ----"
 if command -v lldb >/dev/null 2>&1; then
@@ -47,3 +60,14 @@ for pz in 0x100000000 0x10000 0x1000; do
   rc=0; "$dir/tiny-$pz" 2>&1 | sed -e "s/^/PROBE pagezero=$pz: /" || rc=$?
   echo "PROBE pagezero=$pz: exit status ${PIPESTATUS[0]}"
 done
+
+echo "PROBE ---- segment alignment (MR 11638 links the loader with -Wl,-segalign,0x1000; Apple Silicon pages are 16 KB)"
+for sa in 0x1000 0x4000; do
+  clang -o "$dir/tiny-sa-$sa" "$dir/tiny.c" -Wl,-segalign,$sa 2>&1 | head -2
+  rc=0; "$dir/tiny-sa-$sa" > /dev/null 2>&1 || rc=$?
+  echo "PROBE segalign=$sa: exit status $rc (137 = SIGKILL at exec)"
+done
+printf '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>x.y</string></dict></plist>' > "$dir/x.plist"
+clang -o "$dir/tiny-sa-plist" "$dir/tiny.c" -mmacosx-version-min=12 -Wl,-segalign,0x4000,-sectcreate,__TEXT,__info_plist,"$dir/x.plist" 2>&1 | head -2
+rc=0; "$dir/tiny-sa-plist" > /dev/null 2>&1 || rc=$?
+echo "PROBE segalign=0x4000 + __info_plist section: exit status $rc"

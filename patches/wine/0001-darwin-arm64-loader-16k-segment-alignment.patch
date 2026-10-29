@@ -1,0 +1,34 @@
+From: rl-ios-port <noreply@example.invalid>
+Subject: [PATCH] configure: link the Apple Silicon loader with 16 KB segment alignment
+
+MR 11638 links the macOS arm64 loader with -Wl,-segalign,0x1000. Apple Silicon has 16 KB
+pages and the kernel refuses to exec a Mach-O whose segments are not 16 KB aligned (the
+process is killed with SIGKILL inside execve; observed on macOS 15.7 in CI: reexec_loader()
+-> execv(lib/wine/aarch64-unix/wine) -> SIGKILL, dlls/ntdll/unix/loader.c:2039-2063).
+Use 0x4000.
+
+---
+diff --git a/configure.ac b/configure.ac
+--- a/configure.ac
++++ b/configure.ac
+@@ -1021,7 +1021,7 @@
+         dnl x18 (the Windows ARM64 TEB register) preserved across syscalls and
+         dnl signals; macOS 13+ would otherwise clobber it for binaries built
+         dnl against a newer SDK.
+-        WINELOADER_LDFLAGS="-mmacosx-version-min=12 -Wl,-segalign,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
++        WINELOADER_LDFLAGS="-mmacosx-version-min=12 -Wl,-segalign,0x4000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+         CFLAGS="$CFLAGS -mmacosx-version-min=12"
+         LDFLAGS="$LDFLAGS -mmacosx-version-min=12"
+         wine_use_preloader=no
+diff --git a/configure b/configure
+--- a/configure
++++ b/configure
+@@ -12443,7 +12443,7 @@
+ fi
+         ;;
+       aarch64)
+-                                                                                        WINELOADER_LDFLAGS="-mmacosx-version-min=12 -Wl,-segalign,0x1000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
++                                                                                        WINELOADER_LDFLAGS="-mmacosx-version-min=12 -Wl,-segalign,0x4000,-sectcreate,__TEXT,__info_plist,loader/wine_info.plist"
+         CFLAGS="$CFLAGS -mmacosx-version-min=12"
+         LDFLAGS="$LDFLAGS -mmacosx-version-min=12"
+         wine_use_preloader=no

@@ -32,5 +32,12 @@ for f in "$WINE_PREFIX_DIR"/lib/wine/*-unix/ntdll.so; do
   file "$f"
   if command -v otool >/dev/null; then otool -l "$f" | grep -A4 LC_BUILD_VERSION | head -6; fi
 done
-if command -v otool >/dev/null; then otool -l "$WINE_PREFIX_DIR/bin/wine" 2>/dev/null | grep -B1 -A3 "__PAGEZERO" | head; fi
+if command -v otool >/dev/null; then
+  # bin/wine is a normal PIE (4 GB page zero). Its ntdll.so re-execs the *loader* below (reexec_loader ->
+  # loader_exec, dlls/ntdll/unix/loader.c:2039-2063); whichever image that is must survive exec().
+  for f in "$WINE_PREFIX_DIR/bin/wine" "$WINE_PREFIX_DIR"/lib/wine/*-unix/wine; do
+    [ -f "$f" ] || continue
+    echo "$f:"; file "$f" | cut -d: -f2; otool -l "$f" | grep -B1 -A4 "__PAGEZERO" | head -8; otool -l "$f" | grep -A5 LC_BUILD_VERSION | grep -E "minos|sdk"
+  done
+fi
 if [ -f "$WINE_PREFIX_DIR/lib/wine/aarch64-windows/xtajit64.dll" ]; then echo "xtajit64.dll present"; else echo "xtajit64.dll NOT present"; fi
