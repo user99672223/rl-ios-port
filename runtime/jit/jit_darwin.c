@@ -2,7 +2,8 @@
 // Sources for every system interface used here:
 //   csops / CS_OPS_STATUS          xnu bsd/sys/codesign.h:41,72
 //   CS_DEBUGGED                    xnu osfmk/kern/cs_blobs.h:71
-//   mach_vm_remap                  xnu osfmk/mach/mach_vm.defs:390-404
+//   vm_remap                       xnu osfmk/mach/mach_vm.defs:392-404 (same routine as
+//                                  mach_vm_remap; <mach/mach_vm.h> is unsupported in the iOS SDK)
 //   IORegistryEntryFromPath etc.   IOKitUser IOKitLib.h:266-268, 989-992, 1186-1191;
 //                                  kIOMainPortDefault is documented as a synonym for NULL (:107-113)
 //   kIORegistryEntryPropertyKeysKey xnu iokit/IOKit/IOKitKeys.h:59
@@ -15,7 +16,6 @@
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <mach/mach.h>
-#include <mach/mach_vm.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -82,12 +82,12 @@ static void darwin_detach(void* ctx) {
 }
 
 static void* remap_alias(void* src, size_t len) {
-  mach_vm_address_t dst = 0;
+  vm_address_t dst = 0;
   vm_prot_t cur = 0, max = 0;
-  kern_return_t kr = mach_vm_remap(mach_task_self(), &dst, len, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
-                                   (mach_vm_address_t)(uintptr_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
+  kern_return_t kr = vm_remap(mach_task_self(), &dst, len, 0, VM_FLAGS_ANYWHERE, mach_task_self(),
+                              (vm_address_t)(uintptr_t)src, FALSE, &cur, &max, VM_INHERIT_NONE);
   if (kr != KERN_SUCCESS) {
-    fprintf(stderr, "jit: mach_vm_remap failed: %d\n", kr);
+    fprintf(stderr, "jit: vm_remap failed: %d\n", kr);
     return NULL;
   }
   return (void*)(uintptr_t)dst;

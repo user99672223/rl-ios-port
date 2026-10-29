@@ -22,4 +22,4 @@ jobs:
           xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -dynamiclib \
             -framework CoreFoundation -framework IOKit -o /tmp/libjit.dylib /tmp/jit.c.o /tmp/jit_darwin.c.o
           xcrun otool -L /tmp/libjit.dylib
-          xcrun nm -u /tmp/libjit.dylib | grep -E 'csops|mach_vm_remap|IORegistry|IOObjectRelease'
+          xcrun nm -u /tmp/libjit.dylib | grep -E 'csops|vm_remap|IORegistry|IOObjectRelease'
