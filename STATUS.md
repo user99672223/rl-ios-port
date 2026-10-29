@@ -7,7 +7,7 @@
 | 3. Differential test harness | done locally; ARM64 CI pending | `tests/diff/diff.py`: native x86-64 expectations, FEX `TestHarnessRunner` checks; injected-mismatch selftest passes. vixl-simulator run: 41/200 clean, MXCSR sticky flags never reported and non-default rounding modes ignored (R-006) |
 | 4. Wine ARM64EC + FEX on macOS CI | not started | |
 | 5. `rlaot` | seed + merge done; cache generation pending (R-004) | `aot/rlaot.py` scan/seed/build/dump; FEX's own `ParseCodeMap` reads our code maps identically (`tests/aot/test_rlaot.sh`); seeding is deterministic; real game: 4 modules, 213,064 seed blocks |
-| 6. iOS runtime | app shell done; Wine iOS port not started | `ios/App` (settings, `port.toml`, logging, JIT gate, scenes), `tools/build/ios/build_app.sh`, `ios.yml` Simulator smoke test; `runtime/jit` links against the iOS SDK (`runtime-ios-compile.yml` green) |
+| 6. iOS runtime | app shell done; Wine iOS port not started | `ios/App` (settings, `port.toml`, logging, JIT gate, scenes), `tools/build/ios/build_app.sh`, `ios.yml` Simulator smoke test green (app launches, config written, JIT gate correct, Darwin split mapping runs generated code); `runtime/jit` links against the iOS SDK (`runtime-ios-compile.yml` green) |
 | 7. Graphics | not started | |
 | 8. Auth | bridge + tests done; iOS build unrun | `ios/legendary/bridge.py` (38 tests, network mocked), `ios/Auth` WKWebView login, `tools/cpython/*` + `cpython-ios.yml` (not run yet); D-013, R-010..R-013 |
 | 9. Game-derived build | not started | |
