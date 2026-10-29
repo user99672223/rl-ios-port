@@ -33,8 +33,19 @@ build_llvm() {
     -DLLVM_INCLUDE_DOCS=Off -DLLVM_ENABLE_ZSTD=Off -DLLVM_ENABLE_ZLIB=Off \
     -DLLVM_ENABLE_LIBXML2=Off -DLLVM_ENABLE_TERMINFO=Off -DLLVM_ENABLE_LIBEDIT=Off \
     -DLLVM_VERSION_PRINTER_SHOW_HOST_TARGET_INFO=Off
-  cmake --build "$OUT/llvm-ios-build"
-  cmake --install "$OUT/llvm-ios-build"
+  # Only the static libraries airconv links (DXMT src/airconv/meson.build llvm_deps). Building
+  # "all" also links llvm-tblgen for iOS, which fails: LLVM 15 passes -Wl,--gc-sections there.
+  local libs=(LLVMPasses LLVMTarget LLVMObjCARCOpts LLVMCoroutines LLVMipo LLVMInstrumentation
+    LLVMVectorize LLVMLinker LLVMIRReader LLVMAsmParser LLVMFrontendOpenMP LLVMScalarOpts
+    LLVMInstCombine LLVMAggressiveInstCombine LLVMTransformUtils LLVMBitWriter LLVMAnalysis
+    LLVMProfileData LLVMSymbolize LLVMDebugInfoPDB LLVMDebugInfoMSF LLVMDebugInfoDWARF LLVMObject
+    LLVMTextAPI LLVMMCParser LLVMMC LLVMDebugInfoCodeView LLVMBitReader LLVMCore LLVMRemarks
+    LLVMBitstreamReader LLVMBinaryFormat LLVMSupport LLVMDemangle)
+  ninja -C "$OUT/llvm-ios-build" "${libs[@]}"
+  rm -rf "$OUT/llvm-ios"; mkdir -p "$OUT/llvm-ios/lib" "$OUT/llvm-ios/include"
+  cp "$OUT/llvm-ios-build"/lib/libLLVM*.a "$OUT/llvm-ios/lib/"
+  cp -R "$src/llvm/include/." "$OUT/llvm-ios/include/"
+  cp -R "$OUT/llvm-ios-build/include/." "$OUT/llvm-ios/include/"
   echo "LLVM iOS libs: $(find "$OUT/llvm-ios/lib" -name 'libLLVM*.a' | wc -l)"
 }
 
