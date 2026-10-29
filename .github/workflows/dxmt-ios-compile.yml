@@ -1,0 +1,35 @@
+# Compiles DXMT's Metal bridge (src/winemetal/unix) against the iOS SDK, with patches/dxmt
+# applied. Its error list drives the DXMT iOS port; it goes green when the port compiles.
+name: dxmt-ios-compile
+
+on:
+  push:
+    branches: [main]
+    paths: ["patches/dxmt/**", ".github/workflows/dxmt-ios-compile.yml"]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - run: git submodule update --init --depth 1 external/dxmt
+      - run: tools/apply_patches.sh dxmt || [ ! -d patches/dxmt ]
+      - name: Compile winemetal unix side for iOS (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd external/dxmt
+          rc=0
+          for f in src/winemetal/unix/winemetal_unix.c src/winemetal/unix/cache.c; do
+            echo "== $f"
+            xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -ObjC \
+              -Iinclude -Isrc/airconv -Isrc/winemetal -Isrc/winemetal/unix \
+              -fsyntax-only -ferror-limit=0 "$f" 2>&1 | tee -a /tmp/errors.txt || rc=1
+          done
+          echo "error count: $(grep -c 'error:' /tmp/errors.txt || true)"
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dxmt-ios-errors
+          path: /tmp/errors.txt
