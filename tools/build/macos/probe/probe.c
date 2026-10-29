@@ -161,6 +161,57 @@ static void probe_tpidr(void)
     __asm__ volatile("msr tpidr_el0, %0" : : "r"((uint64_t)0));
 }
 
+/* MR 11638 keeps the TEB in TPIDR_EL0 (msr tpidr_el0, x18 in signal_arm64.c). If TPIDR_EL0 survives
+ * signals, sleep and preemption where x18 does not, PE-side code can read the TEB from it instead of
+ * x18. Same method as the x18 probes above. */
+static void on_usr1_noop(int sig) { (void)sig; }
+static volatile uint64_t tp_zeroed, tp_checks;
+static void *tp_spin_thread(void *arg)
+{
+    const uint64_t want = 0x1122334455667700ull | (uint64_t)(uintptr_t)arg;
+    uint64_t v, bad = 0, n = 0;
+    struct timespec t0, t;
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(want));
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        int i;
+        for (i = 0; i < 100000; i++) {
+            __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v));
+            n++;
+            if (v != want) { bad++; __asm__ volatile("msr tpidr_el0, %0" : : "r"(want)); }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t);
+    } while ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000 < 2000);
+    __sync_fetch_and_add(&tp_zeroed, bad);
+    __sync_fetch_and_add(&tp_checks, n);
+    return NULL;
+}
+
+static void probe_tpidr_survival(void)
+{
+    const uint64_t want = 0x5566778899aabb00ull;
+    uint64_t v;
+    pthread_t th[16];
+    int i, n = 2 * (int)sysconf(_SC_NPROCESSORS_ONLN);
+
+    signal(SIGUSR1, on_usr1_noop);
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(want));
+    raise(SIGUSR1);
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v));
+    PROBE("tpidr_el0_after_signal_return", "%#llx (%s)", (unsigned long long)v, v == want ? "preserved" : "NOT preserved");
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"(want));
+    usleep(20000);
+    __asm__ volatile("mrs %0, tpidr_el0" : "=r"(v));
+    PROBE("tpidr_el0_after_sleep", "%#llx (%s)", (unsigned long long)v, v == want ? "preserved" : "NOT preserved");
+    __asm__ volatile("msr tpidr_el0, %0" : : "r"((uint64_t)0));
+
+    if (n > 16) n = 16;
+    for (i = 0; i < n; i++) pthread_create(&th[i], NULL, tp_spin_thread, (void *)(uintptr_t)i);
+    for (i = 0; i < n; i++) pthread_join(th[i], NULL);
+    PROBE("tpidr_el0_preemption_spin", "%d threads on %ld CPUs, %llu reads in pure user code, %llu observed changed",
+          n, sysconf(_SC_NPROCESSORS_ONLN), (unsigned long long)tp_checks, (unsigned long long)tp_zeroed);
+}
+
 static void sysctl_str(const char *name)
 {
     char buf[256]; size_t len = sizeof(buf);
@@ -179,6 +230,7 @@ int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "rwx")) { probe_rwx_plain(); return 0; }
     if (argc > 1 && !strcmp(argv[1], "x18")) { probe_x18(); probe_x18_preemption(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "tpidr")) { probe_tpidr(); probe_tpidr_survival(); return 0; }
 
     PROBE("sizeof_pointer", "%zu", sizeof(void *));
     PROBE("getpagesize", "%d", getpagesize());
@@ -196,6 +248,7 @@ int main(int argc, char **argv)
     probe_x18();
     probe_x18_preemption();
     probe_tpidr();
+    probe_tpidr_survival();
 
     try_map_fixed("map_fixed_0x7ffe0000", 0x7ffe0000, 0x1000);
     try_map_fixed("map_fixed_0x10000", 0x10000, 0x10000);
