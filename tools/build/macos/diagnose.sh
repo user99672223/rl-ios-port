@@ -32,6 +32,15 @@ fi
 echo "DIAG ---- unified log (kernel, AMFI, syspolicyd) mentioning wine, last 5 minutes"
 log show --last 5m --style compact --predicate 'eventMessage CONTAINS[c] "wine" OR eventMessage CONTAINS[c] "code signature" OR eventMessage CONTAINS[c] "AMFI"' 2>/dev/null | tail -40 | cut -c1-300 | sed -e 's/^/DIAG   /' || true
 
+echo "DIAG ---- install layout"
+ls -la "$bin" "$unixdir" 2>&1 | head -60 | sed -e 's/^/DIAG   /'
+find "$WINE_PREFIX_DIR" -name '*preloader*' -o -name 'wine64*' 2>/dev/null | sed -e 's/^/DIAG   found: /'
+
+echo "DIAG ---- what does the loader try to exec / posix_spawn?"
+if command -v lldb >/dev/null 2>&1; then
+  run_timeout 180 lldb --batch -o 'breakpoint set -n execve' -o 'breakpoint set -n posix_spawn' -o run -o 'expression -- (char*)$x1' -o 'bt 6' -o continue -o 'expression -- (char*)$x1' -o 'bt 6' -o quit -- "$bin/wine" "$exe" 2>&1 | tail -50 | sed -e 's/^/DIAG   /' || true
+fi
+
 echo "DIAG ---- lldb"
 if command -v lldb >/dev/null 2>&1; then
   run_timeout 180 lldb --batch -o run -o 'bt 12' -o 'register read x16 x17 x18 pc sp' -o quit -- "$bin/wine" "$exe" 2>&1 | tail -40 | sed -e 's/^/DIAG   /' || true
