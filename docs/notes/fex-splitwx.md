@@ -97,6 +97,14 @@ Differential (`diff.py gen --count 200`, then `run`): in the simulator 159 of 20
 unpatched, patched, and patched+split. A stricter comparison of the complete GPR/XMM dump for all 200 cases across the
 three variants also has 0 differences.
 
+Native ARM64 CI (`.github/workflows/fex-splitwx.yml`, `ubuntu-24.04-arm`, run 40829436303, commit `63451ef`, green): the same
+6810-test ASM suite is 6795 pass / 15 skipped / 0 fail by default and with `FEX_TEST_SPLITWX=1`, 0 differing tests (this runs
+the real `dc cvau`/`ic ivau` flush and real RX/RW view faults). The strace step shows the two `MAP_SHARED` memfd views
+(`PROT_READ|PROT_WRITE` and `PROT_READ|PROT_EXEC`) for the dispatcher (16 KiB) and the code buffer (16 MiB). The differential cases
+(200) fail 163 of 200 on native ARM64 in both `jit_1` and `jit_500_m` with and without the switch, and the failing sets are
+identical; that failure count is independent of this change and is not investigated here. The in-CI negative self-check
+(block copy written through RX, `JIT.cpp:1166`) makes the split run exit non-zero (rc=8) while the default run stays green (rc=0).
+
 Negative self-checks (split mode, 6810 tests): writing the block copy through RX (`JIT.cpp:1166`) gives 6519 failures
 (`SEGV_ACCERR` at an RX address) while the same binary without the switch passes 100%; writing the block link patch through
 RX (`JIT.cpp:629`) gives 2333 failures; making `Emitter::Bind` patch through RX gives 6519 failures. All restored; final
