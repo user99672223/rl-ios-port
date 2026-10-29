@@ -52,7 +52,9 @@ run_timeout() {
   return "$rc"
 }
 
-toolchain_path() { export PATH="$TOOLCHAIN/bin:$PATH"; }
+# Appended, not prepended: llvm-mingw also ships a `clang`, which must not shadow the host compiler
+# (Apple clang) that Wine uses for its Unix side. Wine finds the PE compilers by their prefixed names.
+toolchain_path() { case ":$PATH:" in *":$TOOLCHAIN/bin:"*) ;; *) export PATH="$PATH:$TOOLCHAIN/bin" ;; esac; }
 wine_env() {
   export PATH="$WINE_PREFIX_DIR/bin:$PATH"
   export WINEPREFIX

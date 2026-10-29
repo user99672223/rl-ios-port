@@ -18,6 +18,9 @@ toolchain_path
 command -v bison >/dev/null && bison --version | head -1
 command -v flex  >/dev/null && flex --version | head -1
 
+# Host compiler: Apple clang on macOS (llvm-mingw's clang is for the PE side only).
+if [ "$IS_DARWIN" = 1 ]; then HOST_CLANG=/usr/bin/clang; else HOST_CLANG=clang; fi
+
 # ccache for the host compiler and for the three PE compilers, via compiler-name symlinks
 # (ccache masquerading: the symlink dir must come first in PATH, real compilers later in PATH).
 if command -v ccache >/dev/null 2>&1; then
@@ -28,10 +31,10 @@ if command -v ccache >/dev/null 2>&1; then
   export CCACHE_DIR=${CCACHE_DIR:-$WORK/ccache}
   export CCACHE_MAXSIZE=${CCACHE_MAXSIZE:-3G}
   export CCACHE_COMPILERCHECK=content
-  CC_HOST="ccache clang"
+  CC_HOST="ccache $HOST_CLANG"
   ccache --zero-stats >/dev/null
 else
-  CC_HOST="clang"
+  CC_HOST="$HOST_CLANG"
 fi
 
 mkdir -p "$WINE_BUILD"; cd "$WINE_BUILD"
@@ -47,6 +50,7 @@ if [ ! -f Makefile ] || [ "${FORCE_CONFIGURE:-0}" = 1 ]; then
             --without-ffmpeg --without-dbus --without-capi --without-pcsclite --without-wayland --without-hwloc
             --without-netapi)
   fi
+  rc=0
   CC="$CC_HOST" \
   CFLAGS="${WINE_HOST_CFLAGS:--O2 -g1}" \
   CROSSCFLAGS="${WINE_PE_CFLAGS:--O2}" \
@@ -54,7 +58,9 @@ if [ ! -f Makefile ] || [ "${FORCE_CONFIGURE:-0}" = 1 ]; then
       --prefix="$WINE_PREFIX_DIR" \
       --enable-archs=arm64ec,aarch64 \
       --disable-win16 \
-      "${extra[@]}" ${WINE_CONFIGURE_EXTRA:-} 2>&1 | tee "$LOG_DIR/wine-configure.log"
+      "${extra[@]}" ${WINE_CONFIGURE_EXTRA:-} 2>&1 | tee "$LOG_DIR/wine-configure.log" || rc=$?
+  cp config.log "$LOG_DIR/wine-config.log" 2>/dev/null || true
+  [ "${rc:-0}" -eq 0 ] && [ -f Makefile ] || { tail -40 config.log 2>/dev/null; die "configure failed"; }
   endgroup
 fi
 

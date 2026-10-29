@@ -17,6 +17,14 @@ clang -O1 -o "$dir/probe" "$MACOS_TOOLS_DIR/probe/probe.c"
 codesign -s - --force "$dir/probe" 2>/dev/null || true
 "$dir/probe"
 
+echo "PROBE ---- does x18 survive depending on the binary's deployment target? (MR 11638 links Wine with -mmacosx-version-min=12)"
+for v in 11.0 12.0 13.0 14.0 15.0; do
+  clang -O1 -mmacosx-version-min=$v -o "$dir/probe-x18-$v" "$MACOS_TOOLS_DIR/probe/probe.c" 2>&1 | head -2
+  codesign -s - --force "$dir/probe-x18-$v" 2>/dev/null || true
+  echo "PROBE minos=$v: $(otool -l "$dir/probe-x18-$v" | grep -A2 LC_BUILD_VERSION | grep minos | tr -s ' ')"
+  "$dir/probe-x18-$v" x18 | grep -E "x18_(after_signal_return|after_sleep|preemption)" | sed -e "s/^PROBE /PROBE minos=$v /"
+done
+
 echo "PROBE ---- W+X mmap with a debugger attached (stand-in for the StikDebug / CS_DEBUGGED case) ----"
 if command -v lldb >/dev/null 2>&1; then
   sudo DevToolsSecurity -enable >/dev/null 2>&1 || true

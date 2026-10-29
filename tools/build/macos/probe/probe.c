@@ -6,6 +6,7 @@
  *
  *   probe            run everything that is safe in one process
  *   probe rwx        only the "W+X without MAP_JIT" check (used under lldb: debugger attached)
+ *   probe x18        only the x18 checks (probe.sh builds this with several -mmacosx-version-min values)
  *
  * Every API used here is documented in the macOS SDK headers / man pages:
  *   mmap(2) MAP_JIT, pthread_jit_write_protect_np(3) and sys_icache_invalidate(3)
@@ -177,6 +178,7 @@ static void sysctl_int(const char *name)
 int main(int argc, char **argv)
 {
     if (argc > 1 && !strcmp(argv[1], "rwx")) { probe_rwx_plain(); return 0; }
+    if (argc > 1 && !strcmp(argv[1], "x18")) { probe_x18(); probe_x18_preemption(); return 0; }
 
     PROBE("sizeof_pointer", "%zu", sizeof(void *));
     PROBE("getpagesize", "%d", getpagesize());
