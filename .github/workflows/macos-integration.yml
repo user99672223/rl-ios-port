@@ -1,0 +1,239 @@
+# Wine (ARM64EC) + FEX on macOS ARM64 (stand-in for iOS: 16 KB pages, x18 not preserved, W^X, 4 GB page zero).
+# PROJECT_SPEC step 4 / 6.10. Synthetic programs only; nothing from any game is used here.
+#
+# Jobs
+#   guest        (ubuntu)  cross-builds FEX's libarm64ecfex.dll + smoke.exe / hello-*.exe with pinned llvm-mingw
+#   probe        (macos)   facts about the runner: page size, W+X rules, x18, mappable address ranges
+#   wine-mr11638 (macos)   approach (a): builds external/wine (MR 11638 head, + patches/wine) with ARM64X PE modules
+#   test-mr11638 (macos)   FEX registered as the emulator; ladder hello-* -> smoke.exe -> conformance subset
+#   wine-3shain  (macos)   approach (c): prebuilt 3Shain "Wine 11.2 ARM64EC" (what DXMT's CI links against)
+name: macos-integration
+
+on:
+  push:
+    branches: [wip/macos-integration, main]
+    paths:
+      - ".github/workflows/macos-integration.yml"
+      - "tools/build/macos/**"
+      - "tests/smoke/**"
+      - "patches/wine/**"
+      - "patches/fex/**"
+  workflow_dispatch:
+    inputs:
+      run_mr11638:
+        description: Build and test the pinned MR 11638 Wine (the expensive job)
+        type: boolean
+        default: true
+      run_3shain:
+        description: Try the prebuilt 3Shain Wine 11.2 ARM64EC
+        type: boolean
+        default: true
+      run_conformance:
+        description: Run the Wine conformance subset
+        type: boolean
+        default: true
+
+concurrency:
+  group: macos-integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  WORK: ${{ github.workspace }}/work/macos
+
+jobs:
+  guest:
+    name: FEX arm64ec DLL + guest programs (cross-build)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch FEX and the nested submodules its build needs
+        run: |
+          git submodule update --init --depth 1 external/fex
+          cd external/fex
+          git submodule update --init --depth 1 External/vixl Source/Common/cpp-optparse External/fmt \
+            External/xxhash External/Catch2 External/range-v3 External/unordered_dense External/rpmalloc \
+            External/jemalloc_glibc External/drm-headers External/tracy External/zydis External/Vulkan-Headers
+      - name: Apply FEX patches (local only, DECISIONS D-008)
+        run: tools/apply_patches.sh fex
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build python3 xz-utils
+      - name: Install pinned llvm-mingw
+        run: tools/build/macos/install-toolchain.sh
+      - name: Build libarm64ecfex.dll (FEX's own CI recipe)
+        run: tools/build/macos/build-fex.sh
+      - name: Build smoke.exe and hello-*.exe
+        run: tools/build/macos/build-smoke.sh
+      - name: Stage artifacts
+        run: |
+          mkdir -p stage
+          cp work/macos/fex-dll/libarm64ecfex.dll stage/
+          cp work/macos/smoke/*.exe stage/
+          (cd stage && sha256sum * | tee SHA256SUMS)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest
+          path: stage/
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-guest
+          path: work/macos/logs/
+          retention-days: 7
+
+  probe:
+    name: macOS ARM64 platform probe
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Probe
+        run: tools/build/macos/probe.sh 2>&1 | tee probe.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-probe
+          path: probe.log
+          retention-days: 14
+
+  wine-mr11638:
+    name: Wine MR 11638 base, ARM64X (macOS)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_mr11638 }}
+    runs-on: macos-15
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch Wine
+        run: git submodule update --init --depth 1 external/wine
+      - name: Cache keys
+        id: keys
+        run: |
+          echo "wine_sha=$(git rev-parse HEAD:external/wine)" >> "$GITHUB_OUTPUT"
+      - name: Apply Wine patches
+        run: tools/apply_patches.sh wine
+      - name: Restore installed Wine
+        id: install-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/macos/wine-install
+            work/macos/conformance-bin
+          key: wine-install-${{ steps.keys.outputs.wine_sha }}-${{ hashFiles('patches/wine/**', 'tools/build/macos/build-wine.sh', 'tools/build/macos/build-conformance.sh', 'tools/build/macos/versions.env') }}
+      - name: Restore ccache
+        if: steps.install-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: work/macos/ccache
+          key: ccache-wine-${{ steps.keys.outputs.wine_sha }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-wine-${{ steps.keys.outputs.wine_sha }}-
+            ccache-wine-
+      - name: Install build dependencies
+        if: steps.install-cache.outputs.cache-hit != 'true'
+        run: tools/build/macos/install-deps-macos.sh
+      - name: Install pinned llvm-mingw
+        if: steps.install-cache.outputs.cache-hit != 'true'
+        run: tools/build/macos/install-toolchain.sh
+      - name: Build Wine
+        id: build
+        if: steps.install-cache.outputs.cache-hit != 'true'
+        run: tools/build/macos/build-wine.sh
+      - name: Build conformance test executables (x86_64 PE)
+        if: steps.install-cache.outputs.cache-hit != 'true' && steps.build.outcome == 'success'
+        run: tools/build/macos/build-conformance.sh
+      - name: Save ccache
+        if: always() && steps.install-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: work/macos/ccache
+          key: ccache-wine-${{ steps.keys.outputs.wine_sha }}-${{ github.run_id }}
+      - name: Save installed Wine
+        if: steps.build.outcome == 'success'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            work/macos/wine-install
+            work/macos/conformance-bin
+          key: wine-install-${{ steps.keys.outputs.wine_sha }}-${{ hashFiles('patches/wine/**', 'tools/build/macos/build-wine.sh', 'tools/build/macos/build-conformance.sh', 'tools/build/macos/versions.env') }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-wine-mr11638
+          path: work/macos/logs/
+          retention-days: 14
+
+  test-mr11638:
+    name: smoke.exe + conformance under Wine MR 11638 + FEX
+    needs: [guest, wine-mr11638]
+    runs-on: macos-15
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cache keys
+        id: keys
+        run: |
+          git submodule update --init --depth 1 external/wine
+          echo "wine_sha=$(git rev-parse HEAD:external/wine)" >> "$GITHUB_OUTPUT"
+      - name: Restore installed Wine
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            work/macos/wine-install
+            work/macos/conformance-bin
+          key: wine-install-${{ steps.keys.outputs.wine_sha }}-${{ hashFiles('patches/wine/**', 'tools/build/macos/build-wine.sh', 'tools/build/macos/build-conformance.sh', 'tools/build/macos/versions.env') }}
+          fail-on-cache-miss: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest
+          path: guest
+      - name: Stage guest binaries
+        run: |
+          mkdir -p work/macos/fex-dll work/macos/smoke
+          cp guest/libarm64ecfex.dll work/macos/fex-dll/
+          cp guest/*.exe work/macos/smoke/
+      - name: Register FEX as the ARM64EC emulator and create the prefix
+        run: tools/build/macos/setup-prefix.sh
+      - name: Ladder (hello-aarch64, hello-arm64ec, hello-x86_64, smoke.exe sections)
+        run: tools/build/macos/run-ladder.sh
+      - name: Conformance subset (x86_64 PE tests through FEX)
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_conformance }}
+        run: tools/build/macos/run-conformance.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-test-mr11638
+          path: work/macos/logs/
+          retention-days: 14
+
+  wine-3shain:
+    name: Prebuilt 3Shain Wine 11.2 ARM64EC (approach c)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_3shain }}
+    needs: [guest]
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned llvm-mingw (for llvm-readobj)
+        run: tools/build/macos/install-toolchain.sh
+      - name: Fetch, verify (SHA-256) and inspect 3Shain wine-11.2
+        run: |
+          mkdir -p work/macos/logs
+          tools/build/macos/fetch-3shain-wine.sh 2>&1 | tee work/macos/logs/fetch-3shain.log
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest
+          path: guest
+      - name: Stage guest binaries
+        run: |
+          mkdir -p work/macos/fex-dll work/macos/smoke
+          cp guest/libarm64ecfex.dll work/macos/fex-dll/
+          cp guest/*.exe work/macos/smoke/
+      - name: Create prefix and register FEX
+        run: tools/build/macos/setup-prefix.sh
+      - name: Ladder
+        run: tools/build/macos/run-ladder.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: logs-wine-3shain
+          path: work/macos/logs/
+          retention-days: 14
