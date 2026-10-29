@@ -5,7 +5,8 @@ encodings of libs/DXBCParser/d3d12tokenizedprogramformat.hpp (DXMT's own parser 
 checked against Wine's wined3d / vkd3d-shader, which parses and disassembles them (see
 docs/notes/dxmt-bc.md).
 
-  vs_4_0   mov o0.xyzw, v0.xyzw ; mov o1.xy, v1.xyxx           (float4 POSITION, float2 TEXCOORD)
+  vs_4_0   SV_VertexID -> position / uv of one oversized triangle (no vertex buffer)
+             r0.x = id & 1, r0.y = id & 2 (as floats); o0 = (4 r0.x - 1, 1 - 2 r0.y, 0, 1); o1 = (2 r0.x, r0.y)
   ps_4_0   sample_l o0.xyzw, v1.xyxx, t0.xyzw, s0, l(MIP)      (one shader per mip level 0..3)
 
 With a point sampler, a shader resource view of the whole mip chain and a render target of the
@@ -19,13 +20,14 @@ import struct
 import sys
 
 # opcodes (D3D10_SB_OPCODE_TYPE order in d3d12tokenizedprogramformat.hpp)
-OP_MOV, OP_RET, OP_SAMPLE_L = 54, 62, 72
-OP_DCL_RESOURCE, OP_DCL_SAMPLER, OP_DCL_INPUT, OP_DCL_INPUT_PS = 88, 90, 95, 98
-OP_DCL_OUTPUT, OP_DCL_OUTPUT_SIV = 101, 103
+OP_AND, OP_MAD, OP_MOV, OP_MUL, OP_RET, OP_SAMPLE_L, OP_UTOF = 1, 50, 54, 56, 62, 72, 86
+OP_DCL_RESOURCE, OP_DCL_SAMPLER, OP_DCL_INPUT_SGV, OP_DCL_INPUT_PS = 88, 90, 96, 98
+OP_DCL_OUTPUT, OP_DCL_OUTPUT_SIV, OP_DCL_TEMPS = 101, 103, 104
 # operand types
-T_INPUT, T_OUTPUT, T_SAMPLER, T_RESOURCE, T_IMMEDIATE32 = 1, 2, 6, 7, 4
+T_TEMP, T_INPUT, T_OUTPUT, T_SAMPLER, T_RESOURCE, T_IMMEDIATE32 = 0, 1, 2, 6, 7, 4
 # misc enums
 NAME_POSITION = 1
+NAME_VERTEX_ID = 6
 INTERP_LINEAR = 2
 RES_DIM_TEXTURE2D = 3
 RET_FLOAT = 5
@@ -53,18 +55,34 @@ def scalar_immediate(float_value):
     return [1 | (T_IMMEDIATE32 << 12), struct.unpack("<I", struct.pack("<f", float_value))[0]]
 
 
+def int_immediate(value):
+    return [1 | (T_IMMEDIATE32 << 12), value]
+
+
+def select1(op_type, index, comp):
+    """A source operand reading one component (select-1 mode)."""
+    return [2 | (2 << 2) | (comp << 4) | (op_type << 12) | (1 << 20), index]
+
+
 XYZW = (0, 1, 2, 3)
 XYXX = (0, 1, 0, 0)
 
 
 def vs_tokens():
     t = []
-    t += [op_token(OP_DCL_INPUT, 3)] + operand(T_INPUT, 0, mask=0xF)
-    t += [op_token(OP_DCL_INPUT, 3)] + operand(T_INPUT, 1, mask=0x3)
+    t += [op_token(OP_DCL_INPUT_SGV, 4)] + operand(T_INPUT, 0, mask=0x1) + [NAME_VERTEX_ID]
     t += [op_token(OP_DCL_OUTPUT_SIV, 4)] + operand(T_OUTPUT, 0, mask=0xF) + [NAME_POSITION]
     t += [op_token(OP_DCL_OUTPUT, 3)] + operand(T_OUTPUT, 1, mask=0x3)
-    t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 0, mask=0xF) + operand(T_INPUT, 0, swizzle=XYZW)
-    t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 1, mask=0x3) + operand(T_INPUT, 1, swizzle=XYXX)
+    t += [op_token(OP_DCL_TEMPS, 2), 1]
+    t += [op_token(OP_AND, 7)] + operand(T_TEMP, 0, mask=0x1) + select1(T_INPUT, 0, 0) + int_immediate(1)
+    t += [op_token(OP_AND, 7)] + operand(T_TEMP, 0, mask=0x2) + select1(T_INPUT, 0, 0) + int_immediate(2)
+    t += [op_token(OP_UTOF, 5)] + operand(T_TEMP, 0, mask=0x3) + operand(T_TEMP, 0, swizzle=XYXX)
+    t += [op_token(OP_MAD, 9)] + operand(T_OUTPUT, 0, mask=0x1) + select1(T_TEMP, 0, 0) + scalar_immediate(4.0) + scalar_immediate(-1.0)
+    t += [op_token(OP_MAD, 9)] + operand(T_OUTPUT, 0, mask=0x2) + select1(T_TEMP, 0, 1) + scalar_immediate(-2.0) + scalar_immediate(1.0)
+    t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 0, mask=0x4) + scalar_immediate(0.0)
+    t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 0, mask=0x8) + scalar_immediate(1.0)
+    t += [op_token(OP_MUL, 7)] + operand(T_OUTPUT, 1, mask=0x1) + select1(T_TEMP, 0, 0) + scalar_immediate(2.0)
+    t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 1, mask=0x2) + select1(T_TEMP, 0, 1)
     t += [op_token(OP_RET, 1)]
     return t
 
@@ -88,13 +106,15 @@ def shader_chunk(version_token, tokens):
 
 
 def signature_chunk(fourcc, elements):
-    """elements: (name, semantic_index, system_value, register, mask, rw_mask). Float components."""
+    """elements: (name, semantic_index, system_value, register, mask, rw_mask[, component_type]); float by default."""
     head = struct.pack("<II", len(elements), 8)
     names = b""
     entries = b""
     base = 8 + 24 * len(elements)
-    for name, sem_idx, sysval, reg, mask, rw in elements:
-        entries += struct.pack("<IIIIIBBH", base + len(names), sem_idx, sysval, 3, reg, mask, rw, 0)
+    for el in elements:
+        name, sem_idx, sysval, reg, mask, rw = el[:6]
+        comp_type = el[6] if len(el) > 6 else 3
+        entries += struct.pack("<IIIIIBBH", base + len(names), sem_idx, sysval, comp_type, reg, mask, rw, 0)
         names += name.encode() + b"\0"
     while len(names) % 4:
         names += b"\0"
@@ -174,7 +194,7 @@ def array(name, data):
 
 def main():
     vs = container([
-        signature_chunk(b"ISGN", [("POSITION", 0, 0, 0, 0xF, 0xF), ("TEXCOORD", 0, 0, 1, 0x3, 0x3)]),
+        signature_chunk(b"ISGN", [("SV_VertexID", 0, NAME_VERTEX_ID, 0, 0x1, 0x1, 1)]),
         signature_chunk(b"OSGN", [("SV_Position", 0, NAME_POSITION, 0, 0xF, 0), ("TEXCOORD", 0, 0, 1, 0x3, 0xC)]),
         shader_chunk(0x00010040, vs_tokens()),
     ])

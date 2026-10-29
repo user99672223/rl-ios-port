@@ -47,8 +47,6 @@ static ID3D11DeviceContext *g_ctx;
 static ID3D11VertexShader *g_vs;
 static ID3D11PixelShader *g_ps[4];  // sample_l at level 0..3
 static ID3D11SamplerState *g_samp;
-static ID3D11InputLayout *g_il;
-static ID3D11Buffer *g_vb;
 static ID3D11RasterizerState *g_rs;
 static bool g_flat = false;
 static bool g_verbose = false;
@@ -141,6 +139,8 @@ static void wait_idle() {
 static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, const SubVec &sv, std::string &err) {
   const int tol = g_tol >= 0 ? g_tol : (g_flat ? 8 : 3);
   HRESULT hr;
+  if (mip == 0)
+    wait_idle();  // uploads / copies / updates of this texture are done before it is sampled
 
   D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
   sd.Format = (DXGI_FORMAT)fi.srv_format;
@@ -187,9 +187,7 @@ static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, con
   D3D11_VIEWPORT vp = {0, 0, (float)sv.w, (float)sv.h, 0, 1};
   g_ctx->RSSetViewports(1, &vp);
   g_ctx->RSSetState(g_rs);
-  UINT stride = 24, offset = 0;
-  g_ctx->IASetInputLayout(g_il);
-  g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &offset);
+  g_ctx->IASetInputLayout(nullptr);  // the vertex shader works from SV_VertexID
   g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   g_ctx->VSSetShader(g_vs, nullptr, 0);
   g_ctx->PSSetShader(g_ps[mip], nullptr, 0);
@@ -588,25 +586,6 @@ static bool init_device() {
       return false;
     }
   }
-  D3D11_INPUT_ELEMENT_DESC el[2] = {
-      {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
-  };
-  if (FAILED(hr = g_dev->CreateInputLayout(el, 2, g_vs_blob, sizeof g_vs_blob, &g_il))) {
-    printf("FAIL setup: CreateInputLayout %s\n", hr_str(hr).c_str());
-    return false;
-  }
-  // one oversized triangle covering the viewport; uv = (0,0) top-left .. (1,1) bottom-right
-  const float tri[3][6] = {{-1, -1, 0, 1, 0, 1}, {-1, 3, 0, 1, 0, -1}, {3, -1, 0, 1, 2, 1}};
-  D3D11_BUFFER_DESC bd = {};
-  bd.ByteWidth = sizeof tri;
-  bd.Usage = D3D11_USAGE_IMMUTABLE;
-  bd.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-  D3D11_SUBRESOURCE_DATA sd = {tri, 0, 0};
-  if (FAILED(hr = g_dev->CreateBuffer(&bd, &sd, &g_vb))) {
-    printf("FAIL setup: CreateBuffer %s\n", hr_str(hr).c_str());
-    return false;
-  }
   D3D11_SAMPLER_DESC sm = {};
   sm.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
   sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
@@ -696,8 +675,6 @@ int main(int argc, char **argv) {
   printf("SUMMARY %d checks, %d failed\n", total, failures);
 
   rel(g_rs);
-  rel(g_vb);
-  rel(g_il);
   for (auto &p : g_ps)
     rel(p);
   rel(g_samp);
