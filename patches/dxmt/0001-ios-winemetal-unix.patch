@@ -1,8 +1,8 @@
 diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
-index 4744692..a3e89e1 100644
+index 4744692..d14da26 100644
 --- a/src/winemetal/unix/winemetal_unix.c
 +++ b/src/winemetal/unix/winemetal_unix.c
-@@ -1,13 +1,28 @@
+@@ -1,13 +1,26 @@
  #include <stdatomic.h>
  #include <dlfcn.h>
 +#include <TargetConditionals.h>
@@ -23,15 +23,13 @@ index 4744692..a3e89e1 100644
 +#include <objc/runtime.h>
 +#include <objc/message.h>
 +#endif
-+#if __has_include(<bootstrap.h>)
++#if !TARGET_OS_IPHONE
  #include <bootstrap.h>
-+#else
-+#include <servers/bootstrap.h>
 +#endif
  #include <mach/mach_port.h>
  #define WINEMETAL_API
  #include "../winemetal_thunks.h"
-@@ -55,7 +70,15 @@ _NSArray_count(void *obj) {
+@@ -55,7 +68,15 @@ _NSArray_count(void *obj) {
  static NTSTATUS
  _MTLCopyAllDevices(void *obj) {
    struct unixcall_generic_obj_ret *params = obj;
@@ -47,7 +45,7 @@ index 4744692..a3e89e1 100644
    return STATUS_SUCCESS;
  }
  
-@@ -2152,6 +2175,44 @@ _MetalLayer_setColorSpace(void *obj) {
+@@ -2152,6 +2173,44 @@ _MetalLayer_setColorSpace(void *obj) {
    return STATUS_SUCCESS;
  }
  
@@ -92,7 +90,7 @@ index 4744692..a3e89e1 100644
  static NTSTATUS
  _WMTGetPrimaryDisplayId(void *obj) {
    struct unixcall_generic_obj_ret *params = obj;
-@@ -2262,6 +2323,7 @@ _WMTGetDisplayDescription(void *obj) {
+@@ -2262,6 +2321,7 @@ _WMTGetDisplayDescription(void *obj) {
    }
    return STATUS_SUCCESS;
  }
@@ -100,7 +98,7 @@ index 4744692..a3e89e1 100644
  
  struct DisplaySetting {
    uint64_t version;
-@@ -2271,6 +2333,16 @@ struct DisplaySetting {
+@@ -2271,6 +2331,16 @@ struct DisplaySetting {
  
  struct DisplaySetting g_display_settings[2] = {{0, 0, {}}, {0, 0, {}}};
  
@@ -117,7 +115,7 @@ index 4744692..a3e89e1 100644
  static NTSTATUS
  _MetalLayer_getEDRValue(void *obj) {
    struct unixcall_generic_obj_ptr_noret *params = obj;
-@@ -2297,6 +2369,7 @@ _MetalLayer_getEDRValue(void *obj) {
+@@ -2297,6 +2367,7 @@ _MetalLayer_getEDRValue(void *obj) {
  
    return STATUS_SUCCESS;
  }
@@ -125,7 +123,7 @@ index 4744692..a3e89e1 100644
  
  static NTSTATUS
  _MTLLibrary_newFunctionWithConstants(void *obj) {
-@@ -2322,7 +2395,7 @@ _WMTQueryDisplaySetting(void *obj) {
+@@ -2322,7 +2393,7 @@ _WMTQueryDisplaySetting(void *obj) {
    CGDirectDisplayID display_id = params->display_id;
    struct WMTHDRMetadata *value = params->hdr_metadata.ptr;
    params->ret = false;
@@ -134,7 +132,7 @@ index 4744692..a3e89e1 100644
    if (setting->version) {
      *value = setting->hdr_metadata;
      params->colorspace = setting->colorspace;
-@@ -2336,7 +2409,7 @@ _WMTUpdateDisplaySetting(void *obj) {
+@@ -2336,7 +2407,7 @@ _WMTUpdateDisplaySetting(void *obj) {
    struct unixcall_update_display_setting *params = obj;
    CGDirectDisplayID display_id = params->display_id;
    const struct WMTHDRMetadata *value = params->hdr_metadata.ptr;
@@ -143,7 +141,7 @@ index 4744692..a3e89e1 100644
    if (value) {
      setting->hdr_metadata = *value;
      setting->colorspace = params->colorspace;
-@@ -2347,6 +2420,16 @@ _WMTUpdateDisplaySetting(void *obj) {
+@@ -2347,6 +2418,16 @@ _WMTUpdateDisplaySetting(void *obj) {
    return STATUS_SUCCESS;
  }
  
@@ -160,7 +158,7 @@ index 4744692..a3e89e1 100644
  static NTSTATUS
  _WMTQueryDisplaySettingForLayer(void *obj) {
    struct unixcall_query_display_setting_for_layer *params = obj;
-@@ -2378,6 +2461,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
+@@ -2378,6 +2459,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
  
    return STATUS_SUCCESS;
  }
@@ -168,3 +166,42 @@ index 4744692..a3e89e1 100644
  
  static NTSTATUS
  _MTLCommandBuffer_encodeWaitForEvent(void *obj) {
+@@ -2605,6 +2687,30 @@ _MTLDevice_newSharedTexture(void *obj) {
+ /* Private API to register a mach port with the bootstrap server */
+ extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
+ 
++#if TARGET_OS_IPHONE
++/* iOS: one process, no bootstrap services or Mach-port shared events. */
++static NTSTATUS
++_WMTBootstrapRegister(void *obj) {
++  return STATUS_UNSUCCESSFUL;
++}
++
++static NTSTATUS
++_WMTBootstrapLookUp(void *obj) {
++  struct unixcall_bootstrap *params = obj;
++  params->mach_port = 0;
++  return STATUS_UNSUCCESSFUL;
++}
++
++static NTSTATUS
++_MTLSharedEvent_createMachPort(void *obj) {
++  return STATUS_UNSUCCESSFUL;
++}
++
++static NTSTATUS
++_MTLDevice_newSharedEventWithMachPort(void *obj) {
++  return STATUS_UNSUCCESSFUL;
++}
++#else
+ static NTSTATUS
+ _WMTBootstrapRegister(void *obj) {
+   struct unixcall_bootstrap *params = obj;
+@@ -2669,6 +2775,7 @@ _MTLDevice_newSharedEventWithMachPort(void *obj) {
+   params->ret_event = (obj_handle_t)[deviceSPI newSharedEventWithMachPort:params->mach_port];
+   return STATUS_SUCCESS;
+ }
++#endif
+ 
+ static NTSTATUS
+ _MTLDevice_registryID(void *obj) {
