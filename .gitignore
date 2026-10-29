@@ -11,3 +11,6 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+
+# Agent worktrees and local Claude state
+/.claude/
