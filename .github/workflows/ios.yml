@@ -50,12 +50,25 @@ jobs:
         run: |
           UDID=${{ steps.sim.outputs.udid }}
           xcrun simctl install "$UDID" out/ios/sim/RLPort.app
-          xcrun simctl launch "$UDID" "$RLPORT_BUNDLE_ID"
+          xcrun simctl launch "$UDID" "$RLPORT_BUNDLE_ID" || echo "::warning::launch request failed"
           DATA=$(xcrun simctl get_app_container "$UDID" "$RLPORT_BUNDLE_ID" data)
           for _ in $(seq 1 30); do [ -f "$DATA/Documents/logs/startup.json" ] && break; sleep 1; done
           mkdir -p out/sim-logs && cp -R "$DATA/Documents/." out/sim-logs/
           cat out/sim-logs/logs/startup.json
           cat out/sim-logs/logs/app.log
+      - name: Diagnostics
+        if: always()
+        run: |
+          UDID=${{ steps.sim.outputs.udid }}
+          mkdir -p out/sim-logs
+          codesign -dvvv --entitlements - out/ios/sim/RLPort.app 2>&1 | tee out/sim-logs/codesign.txt || true
+          xcrun vtool -show-build out/ios/sim/RLPort.app/RLPort | tee out/sim-logs/vtool.txt || true
+          xcrun simctl spawn "$UDID" log show --last 5m --style compact \
+            --predicate 'process == "RLPort" OR eventMessage CONTAINS[c] "rlport" OR eventMessage CONTAINS[c] "dev.rlport.app"' \
+            > out/sim-logs/system.log 2>&1 || true
+          tail -80 out/sim-logs/system.log
+          cp ~/Library/Logs/DiagnosticReports/RLPort* out/sim-logs/ 2>/dev/null || true
+          ls out/sim-logs
       - name: Check startup record
         run: |
           python3 - <<'PY'
