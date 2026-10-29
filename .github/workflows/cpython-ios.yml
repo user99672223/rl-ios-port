@@ -1,0 +1,73 @@
+# CPython for iOS (PEP 730) and the pure-Python packages Legendary needs.
+# Manual only.  Runs the two scripts unchanged and uploads the results:
+#   - python-xcframework: Python.xcframework (device arm64 + simulator arm64/x86_64 slices)
+#   - ios-python-deps:    app_packages (Legendary 0.21.1, requests, certifi, ...) + hash manifest
+# Nothing here touches the game or anything derived from it.
+name: cpython-ios
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cpython-ios:
+    name: Build Python.xcframework and vendor Legendary deps
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch CPython and Legendary submodules
+        run: git submodule update --init --depth 1 external/cpython external/legendary
+
+      # Apple/__main__.py needs Python >= 3.10; the build itself compiles its own build Python.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Xcode and SDKs
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          xcrun --sdk iphonesimulator --show-sdk-version
+
+      - name: Cache iOS dependency archives
+        uses: actions/cache@v4
+        with:
+          path: build/cpython-ios/deps-cache
+          key: cpython-ios-deps-${{ hashFiles('external/cpython/Apple/__main__.py') }}
+
+      - name: Vendor Legendary and its pure-Python dependencies
+        run: tools/cpython/vendor_deps.sh
+
+      - name: Build Python.xcframework (python Apple build iOS)
+        env:
+          CACHE_DIR: ${{ github.workspace }}/build/cpython-ios/deps-cache
+        run: tools/cpython/build_ios.sh
+
+      - name: Package the xcframework (keeps its symlinks)
+        run: |
+          tar -C build/cpython-ios -czf build/cpython-ios/Python.xcframework.tar.gz Python.xcframework
+          ls -l build/cpython-ios
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-xcframework
+          path: |
+            build/cpython-ios/Python.xcframework.tar.gz
+            build/cpython-ios/python-*-iOS-XCframework.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ios-python-deps
+          path: |
+            build/ios-python-deps/app_packages
+            build/ios-python-deps/wheels
+            build/ios-python-deps/cacert.pem
+            build/ios-python-deps/MANIFEST.sha256
+          if-no-files-found: error
+          retention-days: 14
