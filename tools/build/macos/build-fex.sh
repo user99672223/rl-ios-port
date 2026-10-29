@@ -17,7 +17,11 @@ done
 group "configure FEX (arm64ec-w64-mingw32)"
 rm -rf "$FEX_BUILD"
 # Flags copied from external/fex/.github/workflows/wine_build/action.yml (target arm64ec, Release).
+# FEX_TEB_IN_DARWIN_TSD: ARM64EC code reads the TEB from pthread TSD slot 6, not x18, which the Darwin
+# kernel does not preserve (patches/fex/0300, patches/wine/0002). Set FEX_TEB_TSD=0 for stock behaviour.
+TEB_DEF=""; [ "${FEX_TEB_TSD:-1}" = 1 ] && TEB_DEF="-DFEX_TEB_IN_DARWIN_TSD"
 cmake -S "$FEX_SRC" -B "$FEX_BUILD" -G Ninja \
+  -DCMAKE_C_FLAGS="$TEB_DEF" -DCMAKE_CXX_FLAGS="$TEB_DEF" -DCMAKE_ASM_FLAGS="$TEB_DEF" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_TOOLCHAIN_FILE="$FEX_SRC/Data/CMake/toolchain_mingw.cmake" \
   -DMINGW_TRIPLE=arm64ec-w64-mingw32 \
