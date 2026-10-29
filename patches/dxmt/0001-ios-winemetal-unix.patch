@@ -1,0 +1,34 @@
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index 4744692..94eb882 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -1,7 +1,13 @@
+ #include <stdatomic.h>
+ #include <dlfcn.h>
++#include <TargetConditionals.h>
++#if TARGET_OS_IPHONE
++/* iOS port (rl-ios-port): UIKit instead of Cocoa; no ColorSync; one SDR display. */
++#import <UIKit/UIKit.h>
++#else
+ #import <Cocoa/Cocoa.h>
+ #import <ColorSync/ColorSync.h>
++#endif
+ #import <CoreFoundation/CFRunLoop.h>
+ #import <Metal/Metal.h>
+ #import <MetalFX/MetalFX.h>
+@@ -55,7 +61,15 @@ _NSArray_count(void *obj) {
+ static NTSTATUS
+ _MTLCopyAllDevices(void *obj) {
+   struct unixcall_generic_obj_ret *params = obj;
++#if TARGET_OS_IPHONE
++  /* MTLCopyAllDevices is macOS-only; iOS has exactly one device. Returned retained, like
++     MTLCopyAllDevices (callers release it). */
++  id<MTLDevice> device = MTLCreateSystemDefaultDevice();
++  params->ret = (obj_handle_t)(device ? [[NSArray alloc] initWithObjects:device, nil] : [[NSArray alloc] init]);
++  [device release];
++#else
+   params->ret = (obj_handle_t)MTLCopyAllDevices();
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
