@@ -1,4 +1,4 @@
-From 81fbde6399d1534714fceb233ed93d0945757ada Mon Sep 17 00:00:00 2001
+From bf2dcc264ea8f96132512c34fcc44c2276930258 Mon Sep 17 00:00:00 2001
 From: rl-ios-port <noreply@anthropic.com>
 Date: Thu, 29 Oct 2026 10:48:08 +0100
 Subject: [PATCH] ARM64EC: read the TEB from Darwin TSD slot 6 when x18 is not
@@ -168,14 +168,14 @@ index 2489e65..4bc2c46 100644
    ldr x17, [x17, #0x20] // ChpeV2CpuAreaInfo->SuspendDoorbell
    ldr w17, [x17]
 diff --git a/Source/Windows/ARM64EC/Module.cpp b/Source/Windows/ARM64EC/Module.cpp
-index 633f252..30e150c 100644
+index 633f252..a12525d 100644
 --- a/Source/Windows/ARM64EC/Module.cpp
 +++ b/Source/Windows/ARM64EC/Module.cpp
 @@ -7,6 +7,7 @@ $end_info$
  */
  
  #include <FEXCore/fextl/fmt.h>
-+#include "Common/CurrentTEB.h"
++#include "Windows/Common/CurrentTEB.h"
  #include <FEXCore/Core/X86Enums.h>
  #include <FEXCore/Core/SignalDelegator.h>
  #include <FEXCore/Core/Context.h>
@@ -184,7 +184,7 @@ index 633f252..30e150c 100644
  
  ThreadCPUArea GetCPUArea() {
 -  return ThreadCPUArea(NtCurrentTeb());
-+  return ThreadCPUArea(GetCurrentTEB());
++  return ThreadCPUArea(RawCurrentTeb());
  }
  
  FrontendThreadData* GetFrontendThreadData(FEXCore::Core::InternalThreadState* Thread) {
@@ -193,7 +193,7 @@ index 633f252..30e150c 100644
  
      // The TEB is the only populated GDT entry by default
 -    const auto TEB = reinterpret_cast<uint64_t>(NtCurrentTeb());
-+    const auto TEB = reinterpret_cast<uint64_t>(GetCurrentTEB());
++    const auto TEB = reinterpret_cast<uint64_t>(RawCurrentTeb());
      auto GDT = State.GetSegmentFromIndex(State, (Context.SegGs & 0xffff));
      State.SetGDTBase(GDT, TEB);
      State.SetGDTLimit(GDT, 0xF'FFFFU);
@@ -202,19 +202,19 @@ index 633f252..30e150c 100644
    ImageTracker.emplace(*CTX, false);
  
 -  auto MainModule = reinterpret_cast<__TEB*>(NtCurrentTeb())->Peb->ImageBaseAddress;
-+  auto MainModule = reinterpret_cast<__TEB*>(GetCurrentTEB())->Peb->ImageBaseAddress;
++  auto MainModule = reinterpret_cast<__TEB*>(RawCurrentTeb())->Peb->ImageBaseAddress;
    HandleImageMap(reinterpret_cast<uint64_t>(MainModule), true);
  
    HandleImageMap(NtDllBase);
 diff --git a/Source/Windows/Common/CRT/Misc.cpp b/Source/Windows/Common/CRT/Misc.cpp
-index 79a0068..85fb452 100644
+index 79a0068..ee166af 100644
 --- a/Source/Windows/Common/CRT/Misc.cpp
 +++ b/Source/Windows/Common/CRT/Misc.cpp
 @@ -2,6 +2,7 @@
  #define _SECIMP
  #define _CRTIMP
  #include <cstdlib>
-+#include "Common/CurrentTEB.h"
++#include "../CurrentTEB.h"
  #include <cstdint>
  #include <unistd.h>
  #include <wchar.h>
@@ -223,26 +223,26 @@ index 79a0068..85fb452 100644
  void InitEnv() {
    RtlAcquirePebLock();
 -  auto ProcessParams = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(NtCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters);
-+  auto ProcessParams = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(GetCurrentTEB()->ProcessEnvironmentBlock->ProcessParameters);
++  auto ProcessParams = reinterpret_cast<RTL_USER_PROCESS_PARAMETERS64*>(RawCurrentTeb()->ProcessEnvironmentBlock->ProcessParameters);
    wchar_t* EnvW = reinterpret_cast<wchar_t*>(ProcessParams->Environment);
    DWORD SizeW = 4;
    // The PEB environment is terminated by two null wchars.
 diff --git a/Source/Windows/Common/CurrentTEB.h b/Source/Windows/Common/CurrentTEB.h
 new file mode 100644
-index 0000000..e9d0fdc
+index 0000000..bb51dbd
 --- /dev/null
 +++ b/Source/Windows/Common/CurrentTEB.h
 @@ -0,0 +1,16 @@
 +// SPDX-License-Identifier: MIT
 +#pragma once
-+#include <windows.h>
++#include <winternl.h>
 +
-+// The current thread's TEB. mingw's NtCurrentTeb() reads x18 on ARM64/ARM64EC; with
-+// FEX_TEB_IN_DARWIN_TSD (Wine on Apple ARM64, where the kernel does not preserve x18) it is read from
-+// pthread TSD slot 6 (TPIDRRO_EL0 + 0x30), which Wine keeps current for every thread.
-+inline TEB* GetCurrentTEB() {
++// What NtCurrentTeb() returns. mingw's NtCurrentTeb() reads x18 on ARM64/ARM64EC; with
++// FEX_TEB_IN_DARWIN_TSD (Wine on Apple ARM64, where the kernel does not preserve x18) the TEB is read
++// from pthread TSD slot 6 (TPIDRRO_EL0 + 0x30), which Wine keeps current for every thread.
++inline struct _TEB* RawCurrentTeb() {
 +#if defined(FEX_TEB_IN_DARWIN_TSD) && defined(_M_ARM64EC)
-+  TEB** TSD;
++  struct _TEB** TSD;
 +  __asm__("mrs %0, tpidrro_el0" : "=r"(TSD));
 +  return TSD[6];
 +#else
@@ -250,19 +250,18 @@ index 0000000..e9d0fdc
 +#endif
 +}
 diff --git a/Source/Windows/Common/Priv.h b/Source/Windows/Common/Priv.h
-index 10341be..5dae56a 100644
+index 10341be..ab894a3 100644
 --- a/Source/Windows/Common/Priv.h
 +++ b/Source/Windows/Common/Priv.h
-@@ -2,10 +2,11 @@
- #pragma once
+@@ -3,9 +3,10 @@
  
  #include <exception>
-+#include "Common/CurrentTEB.h"
  #include <winternl.h>
++#include "CurrentTEB.h"
  
  static inline __TEB* GetCurrentTEB() {
 -  return reinterpret_cast<__TEB*>(NtCurrentTeb());
-+  return reinterpret_cast<__TEB*>(GetCurrentTEB());
++  return reinterpret_cast<__TEB*>(RawCurrentTeb());
  }
  
  static inline __PEB* GetCurrentPEB() {
