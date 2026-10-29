@@ -1,14 +1,15 @@
 diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
-index 4744692..d14da26 100644
+index 4744692..ab79b88 100644
 --- a/src/winemetal/unix/winemetal_unix.c
 +++ b/src/winemetal/unix/winemetal_unix.c
-@@ -1,13 +1,26 @@
+@@ -1,13 +1,27 @@
  #include <stdatomic.h>
  #include <dlfcn.h>
 +#include <TargetConditionals.h>
 +#if TARGET_OS_IPHONE
 +/* iOS port (rl-ios-port): UIKit instead of Cocoa; no ColorSync; one SDR display. */
 +#import <UIKit/UIKit.h>
++typedef uint32_t CGDirectDisplayID;
 +#else
  #import <Cocoa/Cocoa.h>
  #import <ColorSync/ColorSync.h>
@@ -29,7 +30,7 @@ index 4744692..d14da26 100644
  #include <mach/mach_port.h>
  #define WINEMETAL_API
  #include "../winemetal_thunks.h"
-@@ -55,7 +68,15 @@ _NSArray_count(void *obj) {
+@@ -55,7 +69,15 @@ _NSArray_count(void *obj) {
  static NTSTATUS
  _MTLCopyAllDevices(void *obj) {
    struct unixcall_generic_obj_ret *params = obj;
@@ -45,7 +46,39 @@ index 4744692..d14da26 100644
    return STATUS_SUCCESS;
  }
  
-@@ -2152,6 +2173,44 @@ _MetalLayer_setColorSpace(void *obj) {
+@@ -1219,7 +1241,9 @@ _MTLTexture_replaceRegion(void *obj) {
+ static NTSTATUS
+ _MTLBuffer_didModifyRange(void *obj) {
+   struct unixcall_generic_obj_uint64_uint64_ret *params = obj;
++#if !TARGET_OS_IPHONE
+   [(id<MTLBuffer>)params->handle didModifyRange:NSMakeRange(params->arg, params->ret)];
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -1521,7 +1545,9 @@ _MetalLayer_setProps(void *obj) {
+     layer.opaque = props->opaque;
+     layer.framebufferOnly = props->framebuffer_only;
+     layer.contentsScale = props->contents_scale;
++#if !TARGET_OS_IPHONE
+     layer.displaySyncEnabled = props->display_sync_enabled;
++#endif
+     layer.drawableSize = CGSizeMake(props->drawable_width, props->drawable_height);
+     layer.pixelFormat = to_metal_pixel_format(props->pixel_format);
+   });
+@@ -1537,7 +1563,11 @@ _MetalLayer_getProps(void *obj) {
+   props->opaque = layer.opaque;
+   props->framebuffer_only = layer.framebufferOnly;
+   props->contents_scale = layer.contentsScale;
++#if TARGET_OS_IPHONE
++  props->display_sync_enabled = true;
++#else
+   props->display_sync_enabled = layer.displaySyncEnabled;
++#endif
+   props->drawable_height = layer.drawableSize.height;
+   props->drawable_width = layer.drawableSize.width;
+   props->pixel_format = layer.pixelFormat;
+@@ -2152,6 +2182,44 @@ _MetalLayer_setColorSpace(void *obj) {
    return STATUS_SUCCESS;
  }
  
@@ -90,7 +123,7 @@ index 4744692..d14da26 100644
  static NTSTATUS
  _WMTGetPrimaryDisplayId(void *obj) {
    struct unixcall_generic_obj_ret *params = obj;
-@@ -2262,6 +2321,7 @@ _WMTGetDisplayDescription(void *obj) {
+@@ -2262,6 +2330,7 @@ _WMTGetDisplayDescription(void *obj) {
    }
    return STATUS_SUCCESS;
  }
@@ -98,7 +131,7 @@ index 4744692..d14da26 100644
  
  struct DisplaySetting {
    uint64_t version;
-@@ -2271,6 +2331,16 @@ struct DisplaySetting {
+@@ -2271,6 +2340,16 @@ struct DisplaySetting {
  
  struct DisplaySetting g_display_settings[2] = {{0, 0, {}}, {0, 0, {}}};
  
@@ -115,7 +148,7 @@ index 4744692..d14da26 100644
  static NTSTATUS
  _MetalLayer_getEDRValue(void *obj) {
    struct unixcall_generic_obj_ptr_noret *params = obj;
-@@ -2297,6 +2367,7 @@ _MetalLayer_getEDRValue(void *obj) {
+@@ -2297,6 +2376,7 @@ _MetalLayer_getEDRValue(void *obj) {
  
    return STATUS_SUCCESS;
  }
@@ -123,7 +156,7 @@ index 4744692..d14da26 100644
  
  static NTSTATUS
  _MTLLibrary_newFunctionWithConstants(void *obj) {
-@@ -2322,7 +2393,7 @@ _WMTQueryDisplaySetting(void *obj) {
+@@ -2322,7 +2402,7 @@ _WMTQueryDisplaySetting(void *obj) {
    CGDirectDisplayID display_id = params->display_id;
    struct WMTHDRMetadata *value = params->hdr_metadata.ptr;
    params->ret = false;
@@ -132,7 +165,7 @@ index 4744692..d14da26 100644
    if (setting->version) {
      *value = setting->hdr_metadata;
      params->colorspace = setting->colorspace;
-@@ -2336,7 +2407,7 @@ _WMTUpdateDisplaySetting(void *obj) {
+@@ -2336,7 +2416,7 @@ _WMTUpdateDisplaySetting(void *obj) {
    struct unixcall_update_display_setting *params = obj;
    CGDirectDisplayID display_id = params->display_id;
    const struct WMTHDRMetadata *value = params->hdr_metadata.ptr;
@@ -141,7 +174,7 @@ index 4744692..d14da26 100644
    if (value) {
      setting->hdr_metadata = *value;
      setting->colorspace = params->colorspace;
-@@ -2347,6 +2418,16 @@ _WMTUpdateDisplaySetting(void *obj) {
+@@ -2347,6 +2427,16 @@ _WMTUpdateDisplaySetting(void *obj) {
    return STATUS_SUCCESS;
  }
  
@@ -158,7 +191,7 @@ index 4744692..d14da26 100644
  static NTSTATUS
  _WMTQueryDisplaySettingForLayer(void *obj) {
    struct unixcall_query_display_setting_for_layer *params = obj;
-@@ -2378,6 +2459,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
+@@ -2378,6 +2468,7 @@ _WMTQueryDisplaySettingForLayer(void *obj) {
  
    return STATUS_SUCCESS;
  }
@@ -166,17 +199,33 @@ index 4744692..d14da26 100644
  
  static NTSTATUS
  _MTLCommandBuffer_encodeWaitForEvent(void *obj) {
-@@ -2605,6 +2687,30 @@ _MTLDevice_newSharedTexture(void *obj) {
+@@ -2510,8 +2601,10 @@ static NTSTATUS
+ _MTLBuffer_updateContents(void *obj) {
+   struct unixcall_mtlbuffer_updatecontents *params = obj;
+   memcpy((void *)((char *)[(id<MTLBuffer>)params->buffer contents] + params->offset), params->data.ptr, params->length);
++#if !TARGET_OS_IPHONE
+   if ([(id<MTLBuffer>)params->buffer storageMode] == MTLStorageModeManaged)
+     [(id<MTLBuffer>)params->buffer didModifyRange:NSMakeRange(params->offset, params->length)];
++#endif
+   return STATUS_SUCCESS;
+ }
+ 
+@@ -2602,9 +2695,35 @@ _MTLDevice_newSharedTexture(void *obj) {
+   return STATUS_SUCCESS;
+ }
+ 
++#if !TARGET_OS_IPHONE
  /* Private API to register a mach port with the bootstrap server */
  extern kern_return_t bootstrap_register2(mach_port_t bp, name_t service_name, mach_port_t sp, int flags);
- 
++#endif
++
 +#if TARGET_OS_IPHONE
 +/* iOS: one process, no bootstrap services or Mach-port shared events. */
 +static NTSTATUS
 +_WMTBootstrapRegister(void *obj) {
 +  return STATUS_UNSUCCESSFUL;
 +}
-+
+ 
 +static NTSTATUS
 +_WMTBootstrapLookUp(void *obj) {
 +  struct unixcall_bootstrap *params = obj;
@@ -197,7 +246,7 @@ index 4744692..d14da26 100644
  static NTSTATUS
  _WMTBootstrapRegister(void *obj) {
    struct unixcall_bootstrap *params = obj;
-@@ -2669,6 +2775,7 @@ _MTLDevice_newSharedEventWithMachPort(void *obj) {
+@@ -2669,6 +2788,7 @@ _MTLDevice_newSharedEventWithMachPort(void *obj) {
    params->ret_event = (obj_handle_t)[deviceSPI newSharedEventWithMachPort:params->mach_port];
    return STATUS_SUCCESS;
  }
