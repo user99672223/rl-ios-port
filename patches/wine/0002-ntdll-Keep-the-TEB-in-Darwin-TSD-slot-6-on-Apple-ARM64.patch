@@ -1,0 +1,215 @@
+From 5a2b02ba419ee0ed297c21bf72218c1689698d37 Mon Sep 17 00:00:00 2001
+From: rl-ios-port <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 10:42:45 +0100
+Subject: [PATCH] ntdll: Keep the TEB in Darwin TSD slot 6 on Apple ARM64
+
+The Darwin kernel does not preserve x18 or TPIDR_EL0 for normal tasks; it does
+restore TPIDRRO_EL0 (the pthread TSD base), and libpthread leaves TSD slot 6
+unused for Windows ABI code. The unix side stores each thread's TEB there and the
+syscall paths reload x18 from it instead of a process-wide global. With
+WINE_TEB_IN_DARWIN_TSD defined for PE builds, NtCurrentTeb() and ntdll's
+hand-written PEB loads read the slot instead of x18.
+---
+ dlls/ntdll/ntdll_misc.h        | 10 ++++++++++
+ dlls/ntdll/signal_arm64.c      |  6 +++---
+ dlls/ntdll/signal_arm64ec.c    |  8 ++++----
+ dlls/ntdll/unix/signal_arm64.c | 34 +++++++++++++++++++++++-----------
+ include/winnt.h                | 10 ++++++++++
+ 5 files changed, 50 insertions(+), 18 deletions(-)
+
+diff --git a/dlls/ntdll/ntdll_misc.h b/dlls/ntdll/ntdll_misc.h
+index cf110f8..e810ddd 100644
+--- a/dlls/ntdll/ntdll_misc.h
++++ b/dlls/ntdll/ntdll_misc.h
+@@ -19,6 +19,16 @@
+ #ifndef __WINE_NTDLL_MISC_H
+ #define __WINE_NTDLL_MISC_H
+ 
++/* Load the PEB into REG (an "xN" string) from hand-written PE-side assembly. With
++ * WINE_TEB_IN_DARWIN_TSD (Wine on Apple ARM64, where the kernel does not preserve x18) the TEB comes
++ * from pthread TSD slot 6 (TPIDRRO_EL0 + 0x30), which the unix side keeps current; see
++ * dlls/ntdll/unix/signal_arm64.c and include/winnt.h. */
++#ifdef WINE_TEB_IN_DARWIN_TSD
++#define LOAD_PEB(reg) "mrs " reg ", tpidrro_el0\n\t" "ldr " reg ", [" reg ", #0x30]\n\t" "ldr " reg ", [" reg ", #0x60]\n\t"
++#else
++#define LOAD_PEB(reg) "ldr " reg ", [x18, #0x60]\n\t"
++#endif
++
+ #include <stdarg.h>
+ #include <stdlib.h>
+ #include <sys/types.h>
+diff --git a/dlls/ntdll/signal_arm64.c b/dlls/ntdll/signal_arm64.c
+index d2ccff3..48ab0bf 100644
+--- a/dlls/ntdll/signal_arm64.c
++++ b/dlls/ntdll/signal_arm64.c
+@@ -363,7 +363,7 @@ __ASM_GLOBAL_FUNC( KiUserCallbackDispatcher,
+                    ".seh_handler user_callback_handler, @except\n\t"
+                    "ldr x0, [sp]\n\t"             /* args */
+                    "ldp w1, w2, [sp, #0x08]\n\t"  /* len, id */
+-                   "ldr x3, [x18, 0x60]\n\t"      /* peb */
++                   LOAD_PEB("x3")      /* peb */
+                    "ldr x3, [x3, 0x58]\n\t"       /* peb->KernelCallbackTable */
+                    "ldr x15, [x3, x2, lsl #3]\n\t"
+                    "blr x15\n\t"
+@@ -764,7 +764,7 @@ __ASM_GLOBAL_FUNC( RtlRaiseException,
+                    "ldr w2, [x1]\n\t"            /* context->ContextFlags */
+                    "orr w2, w2, #0x20000000\n\t" /* CONTEXT_UNWOUND_TO_CALL */
+                    "str w2, [x1]\n\t"
+-                   "ldr x3, [x18, #0x60]\n\t"    /* peb */
++                   LOAD_PEB("x3")    /* peb */
+                    "ldrb w2, [x3, #2]\n\t"       /* peb->BeingDebugged */
+                    "cbnz w2, 1f\n\t"
+                    "bl dispatch_exception\n"
+@@ -872,7 +872,7 @@ __ASM_GLOBAL_FUNC( DbgUiRemoteBreakin,
+                    ".seh_save_fplr_x 16\n\t"
+                    ".seh_endprologue\n\t"
+                    ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
+-                   "ldr x0, [x18, #0x60]\n\t"       /* NtCurrentTeb()->Peb */
++                   LOAD_PEB("x0")       /* NtCurrentTeb()->Peb */
+                    "ldrb w0, [x0, 0x02]\n\t"        /* peb->BeingDebugged */
+                    "cbz w0, 1f\n\t"
+                    "bl DbgBreakPoint\n"
+diff --git a/dlls/ntdll/signal_arm64ec.c b/dlls/ntdll/signal_arm64ec.c
+index 140775d..268c75e 100644
+--- a/dlls/ntdll/signal_arm64ec.c
++++ b/dlls/ntdll/signal_arm64ec.c
+@@ -1372,7 +1372,7 @@ __ASM_GLOBAL_FUNC( "#KiUserCallbackDispatcher",
+                    ".seh_handler user_callback_handler, @except\n\t"
+                    "ldr x0, [sp]\n\t"             /* args */
+                    "ldp w1, w2, [sp, #0x08]\n\t"  /* len, id */
+-                   "ldr x3, [x18, 0x60]\n\t"      /* peb */
++                   LOAD_PEB("x3")      /* peb */
+                    "ldr x3, [x3, 0x58]\n\t"       /* peb->KernelCallbackTable */
+                    "ldr x15, [x3, x2, lsl #3]\n\t"
+                    "blr x15\n\t"
+@@ -1896,7 +1896,7 @@ static void __attribute__((naked)) arm64x_check_call(void)
+     asm( ".seh_proc \"#arm64x_check_call\"\n\t"
+          ".seh_endprologue\n\t"
+          /* check for EC code */
+-         "ldr x16, [x18, #0x60]\n\t"        /* peb */
++         LOAD_PEB("x16")        /* peb */
+          "lsr x17, x11, #18\n\t"            /* dest / page_size / 64 */
+          "ldr x16, [x16, #0x368]\n\t"       /* peb->EcCodeBitMap */
+          "lsr x9, x11, #12\n\t"             /* dest / page_size */
+@@ -2052,7 +2052,7 @@ void __attribute((naked)) RtlRaiseException( EXCEPTION_RECORD *rec )
+          "ldr w2, [x1, #0x30]\n\t"     /* context->ContextFlags */
+          "orr w2, w2, #0x20000000\n\t" /* CONTEXT_UNWOUND_TO_CALL */
+          "str w2, [x1, #0x30]\n\t"
+-         "ldr x3, [x18, #0x60]\n\t"    /* peb */
++         LOAD_PEB("x3")    /* peb */
+          "ldrb w2, [x3, #2]\n\t"       /* peb->BeingDebugged */
+          "cbnz w2, 1f\n\t"
+          "bl \"#dispatch_exception\"\n"
+@@ -2156,7 +2156,7 @@ void __attribute__((naked)) DbgUiRemoteBreakin( void *arg )
+          ".seh_save_fplr_x 16\n\t"
+          ".seh_endprologue\n\t"
+          ".seh_handler DbgUiRemoteBreakin_handler, @except\n\t"
+-         "ldr x0, [x18, #0x60]\n\t"  /* NtCurrentTeb()->Peb */
++         LOAD_PEB("x0")  /* NtCurrentTeb()->Peb */
+          "ldrb w0, [x0, 0x02]\n\t"   /* peb->BeingDebugged */
+          "cbz w0, 1f\n\t"
+          "bl \"#DbgBreakPoint\"\n"
+diff --git a/dlls/ntdll/unix/signal_arm64.c b/dlls/ntdll/unix/signal_arm64.c
+index 78b192f..8a99254 100644
+--- a/dlls/ntdll/unix/signal_arm64.c
++++ b/dlls/ntdll/unix/signal_arm64.c
+@@ -38,6 +38,21 @@
+ #ifdef __APPLE__
+ struct syscall_frame * volatile current_syscall_frame;
+ struct _TEB * volatile current_teb;
++
++/* Darwin restores neither x18 nor TPIDR_EL0 for normal tasks (xnu osfmk/arm64/cswitch.s writes
++ * per-CPU data into TPIDR_EL0 and does not preserve x18; osfmk/arm64/machine_task.c only keeps x18
++ * for entitled tasks or macOS binaries built with an SDK older than 13). It does restore
++ * TPIDRRO_EL0, the pthread TSD base, and libpthread leaves TSD slot 6 unused for code targeting the
++ * Windows 64-bit ABI (libpthread private/pthread/tsd_private.h). Slot 6 is therefore a per-thread
++ * TEB pointer that survives context switches, signals and sleeps. */
++#define DARWIN_TEB_TSD_SLOT 6
++
++static inline void darwin_set_tsd_teb( struct _TEB *teb )
++{
++    void **tsd;
++    __asm__ volatile( "mrs %0, tpidrro_el0" : "=r"(tsd) );
++    tsd[DARWIN_TEB_TSD_SLOT] = teb;
++}
+ #endif
+ 
+ #ifdef HAVE_SYS_PARAM_H
+@@ -784,6 +799,7 @@ static void setup_raise_exception( struct thread_data *data, ucontext_t *sigcont
+     REGn_sig(18, sigcontext) = (ULONG_PTR)data->teb;
+ #ifdef __APPLE__
+     __asm__ volatile( "msr tpidr_el0, %0" :: "r"(data->teb) );
++    darwin_set_tsd_teb( data->teb );
+     if (current_teb_ptr) *current_teb_ptr = data->teb;
+     current_teb = data->teb;
+     current_syscall_frame = get_syscall_frame( data );
+@@ -1593,6 +1609,7 @@ void init_syscall_frame( LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
+     frame->x[18] = (ULONG64)teb;
+ #ifdef __APPLE__
+     __asm__ volatile( "msr tpidr_el0, %0" :: "r"(teb) );  /* keep TEB in EL0 thread ID register too */
++    darwin_set_tsd_teb( teb );
+     if (current_teb_ptr) *current_teb_ptr = teb;
+     current_teb = teb;
+     current_syscall_frame = frame;
+@@ -1774,14 +1791,9 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+                    __ASM_CFI(".cfi_offset 28, -0x68\n\t")
+                    "and x20, x8, #0xfff\n\t"    /* syscall number */
+                    "ubfx x21, x8, #12, #2\n\t"  /* syscall table number */
+-                   "mrs x18, tpidr_el0\n\t"
+-                   "mov x17, #0x100000000\n\t"
+-                   "cmp x18, x17\n\t"
+-                   "b.hi 1f\n\t"
+-                   "adrp x18, " __ASM_NAME("current_teb") "@GOTPAGE\n\t"
+-                   "ldr x18, [x18, " __ASM_NAME("current_teb") "@GOTPAGEOFF]\n\t"
+-                   "ldr x18, [x18]\n\t"
+-                   "1:\tldr x16, [x18, #0x370]\n\t" /* thread_data->syscall_table */
++                   "mrs x18, tpidrro_el0\n\t"
++                   "ldr x18, [x18, #0x30]\n\t"   /* TEB from TSD slot 6 */
++                   "ldr x16, [x18, #0x370]\n\t" /* thread_data->syscall_table */
+                    "add x21, x16, x21, lsl #5\n\t"
+                    "ldr x16, [x21, #16]\n\t"    /* table->ServiceLimit */
+                    "cmp x20, x16\n\t"
+@@ -2046,9 +2058,8 @@ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher,
+ 
+ __ASM_GLOBAL_FUNC( __wine_syscall_dispatcher_return,
+ #ifdef __APPLE__
+-                   "adrp x18, " __ASM_NAME("current_teb") "@GOTPAGE\n\t"
+-                   "ldr x18, [x18, " __ASM_NAME("current_teb") "@GOTPAGEOFF]\n\t"
+-                   "ldr x18, [x18]\n\t" /* TEB (frame->x18 may be clobbered by nested syscalls) */
++                   "mrs x18, tpidrro_el0\n\t"
++                   "ldr x18, [x18, #0x30]\n\t" /* TEB from TSD slot 6 (frame->x18 may be clobbered) */
+                    "ldr w11, [x18, #0x380]\n\t" /* thread_data->syscall_trace */
+                    "cbnz x11, " __ASM_LOCAL_LABEL("trace_syscall_ret") "\n\t"
+                    "b " __ASM_LOCAL_LABEL("__wine_syscall_dispatcher_return")
+@@ -2191,6 +2202,7 @@ __ASM_GLOBAL_FUNC( __wine_unix_call_dispatcher,
+ struct syscall_frame * __wine_get_syscall_frame_c(void)
+ {
+     struct thread_data *data = get_thread_data();
++    darwin_set_tsd_teb( data->teb );
+     current_teb = data->teb;
+     current_syscall_frame = get_syscall_frame( data );
+     if (current_teb_ptr) *current_teb_ptr = data->teb;
+diff --git a/include/winnt.h b/include/winnt.h
+index f25ce51..782a8e1 100644
+--- a/include/winnt.h
++++ b/include/winnt.h
+@@ -2596,6 +2596,16 @@ static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
+ {
+     return (struct _TEB *)__readfsdword( 0x18 );
+ }
++#elif (defined(__aarch64__) || defined(__arm64ec__)) && defined(__GNUC__) && defined(WINE_TEB_IN_DARWIN_TSD)
++/* Wine on Apple ARM64: the kernel does not preserve x18, so the TEB is read from pthread TSD slot 6
++ * (TPIDRRO_EL0 + 0x30), which libpthread leaves unused for Windows ABI code and ntdll's unix side
++ * keeps current for every thread (dlls/ntdll/unix/signal_arm64.c). */
++static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
++{
++    struct _TEB **tsd;
++    __asm__( "mrs %0, tpidrro_el0" : "=r" (tsd) );
++    return tsd[6];
++}
+ #elif (defined(__aarch64__) || defined(__arm64ec__)) && defined(__GNUC__)
+ register struct _TEB *__wine_current_teb __asm__("x18");
+ static FORCEINLINE struct _TEB * WINAPI NtCurrentTeb(void)
+-- 
+2.47.3
+

@@ -53,7 +53,9 @@ if [ ! -f Makefile ] || [ "${FORCE_CONFIGURE:-0}" = 1 ]; then
   rc=0
   CC="$CC_HOST" \
   CFLAGS="${WINE_HOST_CFLAGS:--O2 -g1}" \
-  CROSSCFLAGS="${WINE_PE_CFLAGS:--O2}" \
+  # WINE_TEB_IN_DARWIN_TSD: PE code reads the TEB from pthread TSD slot 6 instead of x18, which the
+  # Darwin kernel does not preserve (patches/wine/0002).
+  CROSSCFLAGS="${WINE_PE_CFLAGS:--O2 -DWINE_TEB_IN_DARWIN_TSD}" \
   "$WINE_SRC/configure" \
       --prefix="$WINE_PREFIX_DIR" \
       --enable-archs=arm64ec,aarch64 \
