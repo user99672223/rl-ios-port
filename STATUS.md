@@ -6,7 +6,7 @@
 | 2. Recon | done | `tools/recon/recon.py` over 71 PE files; `docs/RECON_SUMMARY.md`; decisions D-005..D-009, risks R-003..R-005 |
 | 3. Differential test harness | done locally; ARM64 CI pending | `tests/diff/diff.py`: native x86-64 expectations, FEX `TestHarnessRunner` checks; injected-mismatch selftest passes. vixl-simulator run: 41/200 clean, MXCSR sticky flags never reported and non-default rounding modes ignored (R-006) |
 | 4. Wine ARM64EC + FEX on macOS CI | not started | |
-| 5. `rlaot` | redesigned | thin layer over FEX's disk cache and `FEXOfflineCompiler` (D-007) |
+| 5. `rlaot` | seed + merge done; cache generation pending (R-004) | `aot/rlaot.py` scan/seed/build/dump; FEX's own `ParseCodeMap` reads our code maps identically (`tests/aot/test_rlaot.sh`); seeding is deterministic; real game: 4 modules, 213,064 seed blocks |
 | 6. iOS runtime | not started | |
 | 7. Graphics | not started | |
 | 8. Auth | not started | |
