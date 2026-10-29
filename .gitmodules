@@ -1,0 +1,44 @@
+[submodule "external/fex"]
+	path = external/fex
+	url = https://github.com/FEX-Emu/FEX.git
+	shallow = true
+[submodule "external/wine"]
+	path = external/wine
+	url = https://gitlab.winehq.org/trcrsired/wine.git
+	shallow = true
+[submodule "external/dxmt"]
+	path = external/dxmt
+	url = https://github.com/3Shain/dxmt.git
+	shallow = true
+[submodule "external/sdl"]
+	path = external/sdl
+	url = https://github.com/libsdl-org/SDL.git
+	shallow = true
+[submodule "external/freetype"]
+	path = external/freetype
+	url = https://gitlab.freedesktop.org/freetype/freetype.git
+	shallow = true
+[submodule "external/gnutls"]
+	path = external/gnutls
+	url = https://gitlab.com/gnutls/gnutls.git
+	shallow = true
+[submodule "external/nettle"]
+	path = external/nettle
+	url = https://git.lysator.liu.se/nettle/nettle.git
+	shallow = true
+[submodule "external/cpython"]
+	path = external/cpython
+	url = https://github.com/python/cpython.git
+	shallow = true
+[submodule "external/legendary"]
+	path = external/legendary
+	url = https://github.com/derrod/legendary.git
+	shallow = true
+[submodule "external/bcdec"]
+	path = external/bcdec
+	url = https://github.com/iOrange/bcdec.git
+	shallow = true
+[submodule "external/astc-encoder"]
+	path = external/astc-encoder
+	url = https://github.com/ARM-software/astc-encoder.git
+	shallow = true
