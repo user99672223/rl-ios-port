@@ -4,7 +4,7 @@
 |---|---|---|
 | 1. GitHub check and bootstrap | done | private repo `user99672223/rl-ios-port`; 11 submodules pinned shallow; `tools/apply_patches.sh --check` passes (no patches yet) |
 | 2. Recon | done | `tools/recon/recon.py` over 71 PE files; `docs/RECON_SUMMARY.md`; decisions D-005..D-009, risks R-003..R-005 |
-| 3. Differential test harness | not started | |
+| 3. Differential test harness | done locally; ARM64 CI pending | `tests/diff/diff.py`: native x86-64 expectations, FEX `TestHarnessRunner` checks; injected-mismatch selftest passes. vixl-simulator run: 41/200 clean, MXCSR sticky flags never reported and non-default rounding modes ignored (R-006) |
 | 4. Wine ARM64EC + FEX on macOS CI | not started | |
 | 5. `rlaot` | redesigned | thin layer over FEX's disk cache and `FEXOfflineCompiler` (D-007) |
 | 6. iOS runtime | not started | |

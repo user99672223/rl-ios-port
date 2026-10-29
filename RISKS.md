@@ -30,3 +30,10 @@ code maps. Fallback: (2) only, with no prebuilt cache on the first run.
 **Status:** open. `RocketLeague.exe` imports `CreateFiberEx`/`SwitchToFiber`, and EOSSDK imports
 `ConvertThreadToFiber`/`CreateFiber`/`SwitchToFiber`. Fiber switches change the stack and
 TEB fiber data, which interacts with the x18/TEB handling (D-009). Needs a test in the smoke exe.
+
+## R-006 — SSE exception flags and rounding modes under FEX
+**Status:** open. On FEX-2610 in the vixl simulator (x86 host), 200 differential cases showed:
+(1) MXCSR sticky exception flags (bits 0-5) are never set (159/200 cases); (2) results under
+non-default MXCSR rounding (RC=1/2/3) are wrong in ~45% of cases; with RC=0 only 3/45 cases
+differ beyond MXCSR. Real ARM64 results from `linux-arm64.yml` decide whether this is the
+simulator or FEX. Games rarely read MXCSR flags or change RC; FTZ/DAZ matter more.

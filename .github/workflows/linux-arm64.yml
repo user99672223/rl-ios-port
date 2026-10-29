@@ -1,0 +1,69 @@
+# FEX on real ARM64: FEX's own 64-bit ASM instruction tests, plus our differential cases
+# (tests/diff) whose expected values come from native x86-64 execution.
+# Synthetic code only; nothing from the game is used here.
+name: linux-arm64
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      count:
+        description: Differential cases per seed
+        default: "1000"
+
+jobs:
+  diff-cases:
+    name: Generate differential cases (native x86-64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nasm
+      - name: Generate cases with native expectations
+        run: python3 tests/diff/diff.py gen --seed ci --count "${{ inputs.count || '1000' }}" --out build/diff/cases
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diff-cases
+          path: build/diff/cases/
+          retention-days: 7
+
+  fex-arm64:
+    name: FEX tests on ARM64
+    needs: diff-cases
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch FEX and the submodules its build needs
+        run: |
+          git submodule update --init --depth 1 external/fex
+          cd external/fex
+          git submodule update --init --depth 1 External/vixl Source/Common/cpp-optparse External/fmt \
+            External/xxhash External/Catch2 External/range-v3 External/unordered_dense External/rpmalloc \
+            External/jemalloc_glibc External/drm-headers External/tracy External/zydis External/Vulkan-Headers
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang lld ninja-build nasm cmake python3
+      - name: Configure FEX
+        run: >
+          cmake -S external/fex -B build/fex -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DENABLE_LTO=OFF -DBUILD_TESTING=ON
+          -DBUILD_FEXCONFIG=OFF -DENABLE_OFFLINE_TELEMETRY=OFF -DTUNE_CPU=generic
+      - name: Build FEX test runner and ASM tests
+        run: ninja -C build/fex TestHarnessRunner asm_files
+      - name: FEX upstream 64-bit ASM tests
+        run: ninja -C build/fex 64bit_asm_tests
+      - uses: actions/download-artifact@v4
+        with:
+          name: diff-cases
+          path: build/diff/cases
+      - name: Differential tests (native x86-64 expectations vs FEX ARM64 JIT)
+        run: python3 tests/diff/diff.py run --cases build/diff/cases --runner build/fex/Bin/TestHarnessRunner
+      - name: Injected-mismatch self-test
+        if: always()
+        run: python3 tests/diff/diff.py selftest --cases build/diff/cases --runner build/fex/Bin/TestHarnessRunner
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diff-report
+          path: build/diff/cases/report.json
