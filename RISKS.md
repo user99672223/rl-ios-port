@@ -52,3 +52,30 @@ emission, block linking/backpatching, dispatcher and thunk generation, and copyi
 hits (D-007). QEMU's TCG did the same (`tcg_splitwx_diff`). Branch targets and literals must
 be computed from the RX address.
 **Fallback:** none that preserves JIT. This is next in line after the macOS integration work.
+
+## R-008 — rsync over AFC at 40 GB scale is unverified
+Tested only against a local directory. Unknown: USB throughput, `--inplace` on multi-GB files through
+ifuse, phone sleep mid-copy (the script resumes by size). Fallbacks: plain `cp -r` over ifuse, the Files app.
+
+## R-009 — StikDebug may not auto-assign the universal script to this app
+StikDebug picks its iOS 26 script per bundle id or from a fixed list of app names
+(`StikDebug/Support/AutoScriptAssignments.swift`). The port isn't on the list, so the universal script
+may need assigning by hand once. If it isn't, the app's prepare call fails and the app says so (D-010).
+
+## R-010 — pycryptodomex has no iOS build
+Legendary imports it at module level (`chunk.py:8`, `manifest.py:13`) but only needs it for encrypted
+manifests/chunks. The bridge installs a placeholder whose `AES.new` raises "cannot decrypt". Auth, import,
+and launch don't need it. Fix if ever needed: cross-build it and patch its `.so` loader for `.fwork`.
+
+## R-011 — `import legendary.core` on iOS is unproven
+It imports `multiprocessing`/`shared_memory` at module level (`downloader/mp/manager.py:9-11`), which
+CPython documents as unusable on iOS. Fallback: stub those imports in the bridge; the downloader is unused.
+
+## R-012 — Epic login inside WKWebView may be blocked
+Captcha or identity-provider flows may refuse an embedded web view. Fallback: open `login_url()` in Safari
+and paste the code; `complete_login()` accepts the bare code or the pasted JSON.
+
+## R-013 — The exchange code in argv is a secret
+`-AUTH_PASSWORD=` is a short-lived one-time code: fetch it right before start, never log or persist argv
+(use the bridge's `redacted_argv`). Locale: on iOS `LANG` is unset, so Legendary uses `en-US` unless
+`[Legendary] locale` is set.
