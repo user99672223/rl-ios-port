@@ -26,15 +26,26 @@ jobs:
           git -C external/dxmt submodule update --init --depth 1 include/native/directx
           tools/apply_patches.sh dxmt
       - run: brew install ninja
-      - name: Cache LLVM for iOS
+      # Keyed on the LLVM recipe only (the build_llvm function), so airconv-only changes reuse
+      # it; saved right after building so a later failing step doesn't discard it.
+      - name: LLVM cache key
+        id: llvm-key
+        run: echo "key=llvm-15.0.7-ios17-$(sed -n '/^build_llvm()/,/^}/p' tools/build/ios/build_airconv.sh | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Restore LLVM for iOS
         id: llvm-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: build/ios-deps/llvm-ios
-          key: llvm-15.0.7-ios17-${{ hashFiles('tools/build/ios/build_airconv.sh') }}
+          key: ${{ steps.llvm-key.outputs.key }}
       - name: Build LLVM 15.0.7 for iOS
         if: steps.llvm-cache.outputs.cache-hit != 'true'
         run: tools/build/ios/build_airconv.sh llvm
+      - name: Save LLVM for iOS
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/ios-deps/llvm-ios
+          key: ${{ steps.llvm-key.outputs.key }}
       - name: Build airconv for iOS
         run: tools/build/ios/build_airconv.sh airconv
       - name: Link test (airconv + LLVM + winemetal for iOS)
