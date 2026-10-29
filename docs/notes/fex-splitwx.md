@@ -59,9 +59,9 @@ FEX does not use vixl's assembler: vixl is only the simulator/disassembler (`Ext
 | Block link / relink | `JIT.cpp:629-630,634,643-644` | branch and `ldr` stores via RW; `Record->HostCode` via RW |
 | Block delink | `JIT.cpp:551-552,562-563` | stores via RW |
 | Unaligned-atomic backpatch (signal) | `Arm64.cpp:2105-2160` | stores via RW; `SpinLockFutex` in the block tail via RW |
-| Code cache (`ENABLECODECACHINGWIP`) alloc/free | `CodeCache.cpp:52,706-718,730` | split-aware load, RX span + RW span |
-| Code cache finalize | `CodeCache.cpp:861,967-976,1034` | eager, relocations via RW, flush RX |
-| Code cache store/validate (relocate live buffer in place) | `CodeCache.cpp:359-360,429` | writable alias |
+| Code cache (`ENABLECODECACHINGWIP`) alloc/free | `CodeCache.cpp:52,60,713-719,734-743` | split-aware load, RX span + RW span |
+| Code cache finalize | `CodeCache.cpp:867,972-981,1040` | eager, relocations via RW, flush RX |
+| Code cache store/validate (relocate live buffer in place) | `CodeCache.cpp:360-361,430` | writable alias |
 
 Audited and unchanged (no code writes): block emission itself runs into a per-thread temp buffer (`JIT.cpp:925`
 region, `RXBias` 0) and is position independent, as `Arm64Emitter.cpp:524-529` notes; DiskCache relocation patching
@@ -102,20 +102,40 @@ Negative self-checks (split mode, 6810 tests): writing the block copy through RX
 RX (`JIT.cpp:629`) gives 2333 failures; making `Emitter::Bind` patch through RX gives 6519 failures. All restored; final
 split run is 0 differing tests again.
 
+## ARM64EC / Windows executable-allocation inventory (iOS: nothing may use `VirtualAlloc(..., Execute=true)`)
+
+Under the prot4k iOS policy an executable `VirtualAlloc`/`NtAllocateVirtualMemory` is treated as emulated guest memory
+(no host X) unless it is an EC code range. FEX's host-executed ARM64 code therefore has to come from the hook
+(`runtime/jit`), which Wine never sees. Every site that allocates executable memory in the Windows tree:
+
+| Allocation | Where | Host-executed ARM64? | Status |
+|---|---|---|---|
+| JIT code buffers | `SharedCodeBufferManager.cpp:22` (`AllocateCodeMemory`) | yes | through the hook |
+| Dispatcher | `Dispatcher.cpp:40` (`AllocateCodeMemory`) | yes | through the hook |
+| Mapped code cache (`ENABLECODECACHINGWIP`), ARM64EC | `CodeCache.cpp:734-743` | yes | through the hook (was `VirtualAlloc(Size, true)`); finalize writes via the RW alias (`CodeCache.cpp:972-981`), freed with `FreeCodeMemory` (`CodeCache.cpp:60`) |
+| Default `AllocateCodeMemory` when no hook is installed | `CodeMemory.cpp` `AllocateCodeMemory` -> `AllocatorHooks.h:49-61` (`VirtualAlloc2` with `MEM_EXTENDED_PARAMETER_EC_CODE`, `PAGE_EXECUTE_READWRITE`) | yes | upstream behaviour; on iOS a hook is mandatory |
+| `X64ReturnInstr` | `Source/Windows/ARM64EC/Module.cpp:695-698` | **no**: one x86-64 `ret` (0xC3) byte, used as a return address from native ARM64 code (`Module.S:95-96`) and executed by FEX as *guest* code, then registered with the InvalidationTracker as `PAGE_EXECUTE_READ` | **left on `VirtualAlloc` on purpose**: it must be emulated guest-executable memory, which is what the Wine policy gives an executable VirtualAlloc; moving it into hook memory would hide it from guest-code tracking |
+| WoW64 32-bit address space reservation | `Source/Windows/WOW64/Module.cpp:550` (`NtAllocateVirtualMemory`, `PAGE_EXECUTE_READWRITE`) | no (guest 32-bit memory) | left, guest memory |
+| `atomic_segmented_bitmap_allocator.h:63` | `VirtualAlloc(arena_size, true)` | would be, but it has no users | left |
+| Staging buffer for lazy code-cache finalize | `CodeCache.cpp:1000` (non-Windows only) | no (copied then remapped) | non-split only; not reached when split |
+
+Nothing else in `Source/Windows` allocates executable memory (`WinAPI/Alloc.cpp` forwards the guest's own calls;
+`InvalidationTracker`/`ImageTracker` only change protections of guest images).
+
+Open for the ARM64EC FEX module: `SetCodeMemoryHooks` must run before the first `Context` is created. The module is a PE DLL
+inside Wine and cannot link `runtime/jit` directly, so it needs a way to get the three function pointers (for example an
+export that `runtime/jit` or the Wine unixlib fills in before `libarm64ecfex.dll` attaches). Not designed here.
+
 ## Not exercised / left
 
 * ARM64-only paths cannot run in the simulator (no host SIGBUS): the unaligned-atomic backpatch
   `Arm64.cpp:2105-2160` and the real `dc cvau`/`ic ivau` flush (`CodeMemory.cpp` `SplitFlushARM64`). They run in the
   native ARM64 CI workflow `fex-splitwx.yml`, but only if the ASM tests hit them (some `Atomics` tests are meant to).
-* `ENABLECODECACHINGWIP` mapped code cache in split mode (`CodeCache.cpp:706-718,967-976`): written, builds, not run
+* `ENABLECODECACHINGWIP` mapped code cache in split mode (`CodeCache.cpp:713-719,972-981`): written, builds, not run
   (it needs generated caches). Non-split behaviour is untouched, including the RWX staging buffer + `mremap`
-  (`CodeCache.cpp:994,1014`), which needs RWX by design and stays upstream-only.
-* Windows / ARM64EC / WoW64 (cannot be built or run here): default allocation in `CodeMemory.cpp` still calls the
-  RWX `VirtualAlloc(Size, true)` (`AllocatorHooks.h:58-61`); `CodeCache.cpp:57,730-733,1024` ARM64EC branches (RWX
-  alloc, in-place `memcpy`/relocation, `FreeCodeMemory` not used); `Source/Windows/ARM64EC/Module.cpp:928-937`
-  (`FlushInstructionCacheHeavy`, `BTCpu64FlushInstructionCache`) and `Source/Windows/WOW64/Module.cpp:814-819`
-  forward to the OS and were not touched. Not relevant to the iOS Wine path unless the ARM64EC FEX module is used there:
-  the hooks are the same, but these call sites would need the same treatment (see list).
+  (`CodeCache.cpp:1000,1020`), which needs RWX by design and stays upstream-only.
+* Windows / ARM64EC / WoW64 code cannot be built or run on this host. The `#ifdef _M_ARM64EC` edits
+  (`CodeCache.cpp:60,734-743,972-981`) were written by reading and are unexercised. See the inventory below.
 * `JIT.cpp:637` `dc cvau` is given `Record->HostCode` (the value, a code address) rather than its address; this is
   upstream behaviour and harmless (data caches are physically tagged), left as is.
 * No hook implementation for the app side yet: `runtime/jit` needs a small adapter that fills `CodeMemoryHooks` and calls

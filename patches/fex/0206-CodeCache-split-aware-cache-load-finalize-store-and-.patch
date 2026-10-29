@@ -1,16 +1,16 @@
-From d968e7318328a53b4615d043a42c0c93c5637df5 Mon Sep 17 00:00:00 2001
+From 9d38f65ca78e0c6efa7802c55676985565e7f75b Mon Sep 17 00:00:00 2001
 From: splitwx <splitwx@local>
 Date: Thu, 29 Oct 2026 06:42:00 +0100
-Subject: [PATCH 206/206] CodeCache: split-aware cache load, finalize, store
- and validate
+Subject: [PATCH] CodeCache: split-aware cache load, finalize, store and
+ validate
 
 ---
- FEXCore/Source/Interface/Core/CodeCache.cpp | 63 ++++++++++++++++-----
+ FEXCore/Source/Interface/Core/CodeCache.cpp | 77 ++++++++++++++++-----
  FEXCore/include/FEXCore/Core/CodeCache.h    |  6 ++
- 2 files changed, 54 insertions(+), 15 deletions(-)
+ 2 files changed, 64 insertions(+), 19 deletions(-)
 
 diff --git a/FEXCore/Source/Interface/Core/CodeCache.cpp b/FEXCore/Source/Interface/Core/CodeCache.cpp
-index 87a110c..fb804d0 100644
+index 87a110c..768fdc0 100644
 --- a/FEXCore/Source/Interface/Core/CodeCache.cpp
 +++ b/FEXCore/Source/Interface/Core/CodeCache.cpp
 @@ -29,6 +29,7 @@
@@ -21,7 +21,7 @@ index 87a110c..fb804d0 100644
  
  #include <fstream>
  
-@@ -48,7 +49,9 @@ MappedCodeCacheFile::~MappedCodeCacheFile() {
+@@ -48,12 +49,15 @@ MappedCodeCacheFile::~MappedCodeCacheFile() {
    }
  
  #ifndef _WIN32
@@ -32,7 +32,14 @@ index 87a110c..fb804d0 100644
      FEXCore::Allocator::munmap(CodeBuffer.data(), CodeBuffer.size_bytes());
    }
  #elif defined(_M_ARM64EC)
-@@ -352,8 +355,9 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
+   if (!CodeBuffer.empty()) {
+-    FEXCore::Allocator::VirtualFree(CodeBuffer.data(), CodeBuffer.size_bytes());
++    // Allocated with AllocateCodeMemory: VirtualFree unless the host provides split code memory.
++    FEXCore::Allocator::FreeCodeMemory(CodeBuffer.data(), CodeBuffer.size_bytes());
+   }
+ #endif
+ }
+@@ -352,8 +356,9 @@ bool CodeCache::SaveData(Core::InternalThreadState& Thread, int fd, const Execut
    }
  
    // Dump the host code (relocated for position-independent serialization)
@@ -44,7 +51,7 @@ index 87a110c..fb804d0 100644
    if (!ApplyCodeRelocations(SerializedBaseAddress, CodeBufferData, Relocations, true)) {
      LOGMAN_THROW_A_FMT(false, "Failed to apply code relocations");
      return false;
-@@ -422,7 +426,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
+@@ -422,7 +427,7 @@ void CodeCache::Validate(const ExecutableFileSectionInfo& Section, fextl::set<ui
    }
  
    std::span<std::byte> CodeBufferRangeRef =
@@ -53,7 +60,7 @@ index 87a110c..fb804d0 100644
        .subspan(0, CachedCode.size_bytes());
  
    while (!GuestBlocks.empty()) {
-@@ -699,16 +703,30 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
+@@ -699,25 +704,44 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
    Cursor = reinterpret_cast<std::byte*>(AlignUp(reinterpret_cast<uintptr_t>(Cursor), Utils::FEX_PAGE_SIZE));
    auto CodeDataInFile = std::span {Cursor, header.CodeBufferSize};
  
@@ -92,7 +99,24 @@ index 87a110c..fb804d0 100644
  #elif defined(_M_ARM64EC)
    // TODO: Implement lazy mapping on Windows
    // NOTE: The executed code must have MEM_EXTENDED_PARAMETER_EC_CODE set, so we can't operate on the mapped cache file directly
-@@ -737,9 +755,11 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
+-  void* CodeBufferAllocation = Allocator::VirtualAlloc(header.CodeBufferSize, true);
+-  if (!CodeBufferAllocation) {
++  // Executable memory comes from AllocateCodeMemory: the EC-code VirtualAlloc by default, or the host's
++  // split RX/RW code memory (iOS), in which case the RW alias is written and the RX view executed.
++  const auto Memory = Allocator::AllocateCodeMemory(header.CodeBufferSize);
++  if (!Memory.RX) {
+     LogMan::Msg::EFmt("Failed to allocate code cache memory");
+     return nullptr;
+   }
+-  auto CodeBuffer = std::span {reinterpret_cast<std::byte*>(CodeBufferAllocation), header.CodeBufferSize};
++  auto CodeBuffer = std::span {reinterpret_cast<std::byte*>(Memory.RX), header.CodeBufferSize};
++  if (Memory.RW != Memory.RX) {
++    CodeBufferWritable = std::span {reinterpret_cast<std::byte*>(Memory.RW), header.CodeBufferSize};
++  }
+ #else // WoW64
+   // TODO: Implement lazy mapping on Windows
+   auto CodeBuffer = CodeDataInFile;
+@@ -737,9 +761,11 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
    }
  
    auto Storage = FEXCore::Allocator::aligned_alloc(alignof(MappedCodeCacheFile), sizeof(MappedCodeCacheFile));
@@ -105,7 +129,7 @@ index 87a110c..fb804d0 100644
  }
  
  bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCodeCacheFile& Code, const ExecutableFileSectionInfo& BinarySection) {
-@@ -838,7 +858,7 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
+@@ -838,7 +864,7 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
    }
  
  #ifndef _WIN32
@@ -114,12 +138,12 @@ index 87a110c..fb804d0 100644
  #else
    // TODO: Implement lazy mapping on Windows
    if (true) {
-@@ -944,6 +964,19 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
+@@ -943,6 +969,19 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
+ 
    FEXCORE_PROFILE_SCOPED("FinalizeCodePages");
  
- #ifndef _WIN32
 +  if (!Code.CodeBufferWritable.empty()) {
-+    // Split code memory: populate and relocate through the RW alias (like the ARM64EC path below).
++    // Split code memory: populate and relocate through the RW alias (this also covers ARM64EC).
 +    // The RX view is only ever read and executed.
 +    memcpy(Code.CodeBufferWritable.data() + StartOffset, Code.CodeBufferInFile.data() + StartOffset, Size);
 +    for (size_t i = StartPage; i < EndPage; ++i) {
@@ -131,10 +155,10 @@ index 87a110c..fb804d0 100644
 +    return;
 +  }
 +
+ #ifndef _WIN32
    // Atomicity is critical when making the finalized code data visible.
    // We ensure this by remapping a temporary buffer onto the PROT_NONE
-   // placeholder page in CodeBuffer. Some constraints to keep in mind are:
-@@ -998,7 +1031,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
+@@ -998,7 +1037,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
    }
  #endif
  
