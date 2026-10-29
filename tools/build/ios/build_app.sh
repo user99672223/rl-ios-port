@@ -39,8 +39,15 @@ sed -e "s/\$(EXECUTABLE_NAME)/$NAME/" -e "s/\$(PRODUCT_NAME)/$NAME/" -e "s/\$(PR
     -e "s/\$(RLPORT_BUNDLE_ID)/$BUNDLE_ID/" -e "s/\$(MARKETING_VERSION)/$VERSION/" \
     -e "s/\$(CURRENT_PROJECT_VERSION)/$BUILD/" -e "s/\$(IPHONEOS_DEPLOYMENT_TARGET)/$IOS_MIN/" \
     "$ROOT/ios/App/Info.plist" > "$APP/Info.plist"
-# shellcheck disable=SC2016  # literal "$(" on purpose
-if grep -q '\$(' "$APP/Info.plist"; then echo "unfilled build variable in Info.plist" >&2; exit 1; fi
+# Check parsed values only (the template's XML comment mentions the $(...) syntax).
+python3 - "$APP/Info.plist" <<'PY'
+import plistlib, sys
+def walk(v):
+    if isinstance(v, dict): [walk(x) for x in v.values()]
+    elif isinstance(v, list): [walk(x) for x in v]
+    elif isinstance(v, str) and "$(" in v: sys.exit(f"unfilled build variable in Info.plist: {v}")
+walk(plistlib.load(open(sys.argv[1], "rb")))
+PY
 plutil -lint "$APP/Info.plist"
 if [ "$KIND" = simulator ]; then
   plutil -replace CFBundleSupportedPlatforms -json '["iPhoneSimulator"]' "$APP/Info.plist"
