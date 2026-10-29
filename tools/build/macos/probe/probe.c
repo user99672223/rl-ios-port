@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -112,6 +113,41 @@ static void probe_x18(void)
     }
 }
 
+/* Does x18 survive plain computation under CPU contention (preemption), or only syscalls/signals that
+ * reschedule? One spinning thread per CPU plus extras, each checking x18 in a tight loop. */
+static volatile uint64_t spin_zeroed, spin_checks;
+static void *spin_thread(void *arg)
+{
+    uint64_t v, zeros = 0, n = 0;
+    struct timespec t0, t;
+    (void)arg;
+    __asm__ volatile("mov x18, %0" : : "r"((uint64_t)0x1122334455667788ull));
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    do {
+        int i;
+        for (i = 0; i < 100000; i++) {
+            __asm__ volatile("mov %0, x18" : "=r"(v));
+            n++;
+            if (v != 0x1122334455667788ull) { zeros++; __asm__ volatile("mov x18, %0" : : "r"((uint64_t)0x1122334455667788ull)); }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &t);       /* vDSO-less on macOS: commpage read, no scheduling point */
+    } while ((t.tv_sec - t0.tv_sec) * 1000 + (t.tv_nsec - t0.tv_nsec) / 1000000 < 2000);
+    __sync_fetch_and_add(&spin_zeroed, zeros);
+    __sync_fetch_and_add(&spin_checks, n);
+    return NULL;
+}
+
+static void probe_x18_preemption(void)
+{
+    pthread_t th[16];
+    int i, n = 2 * (int)sysconf(_SC_NPROCESSORS_ONLN);
+    if (n > 16) n = 16;
+    for (i = 0; i < n; i++) pthread_create(&th[i], NULL, spin_thread, NULL);
+    for (i = 0; i < n; i++) pthread_join(th[i], NULL);
+    PROBE("x18_preemption_spin", "%d threads on %ld CPUs, %llu x18 reads in pure user code, %llu observed clobbered",
+          n, sysconf(_SC_NPROCESSORS_ONLN), (unsigned long long)spin_checks, (unsigned long long)spin_zeroed);
+}
+
 static void probe_tpidr(void)
 {
     uint64_t ro, rw;
@@ -156,6 +192,7 @@ int main(int argc, char **argv)
     probe_rwx_plain();
     probe_map_jit();
     probe_x18();
+    probe_x18_preemption();
     probe_tpidr();
 
     try_map_fixed("map_fixed_0x7ffe0000", 0x7ffe0000, 0x1000);

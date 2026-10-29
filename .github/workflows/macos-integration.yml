@@ -54,7 +54,7 @@ jobs:
             External/xxhash External/Catch2 External/range-v3 External/unordered_dense External/rpmalloc \
             External/jemalloc_glibc External/drm-headers External/tracy External/zydis External/Vulkan-Headers
       - name: Apply FEX patches (local only, DECISIONS D-008)
-        run: tools/apply_patches.sh fex
+        run: if [ -n "$(ls patches/fex/[0-9][0-9][0-9][0-9]-*.patch 2>/dev/null)" ]; then tools/apply_patches.sh fex; else echo 'no patches/fex yet'; fi
       - name: Install tools
         run: sudo apt-get update -qq && sudo apt-get install -y -qq cmake ninja-build python3 xz-utils
       - name: Install pinned llvm-mingw
@@ -109,7 +109,8 @@ jobs:
         run: |
           echo "wine_sha=$(git rev-parse HEAD:external/wine)" >> "$GITHUB_OUTPUT"
       - name: Apply Wine patches
-        run: tools/apply_patches.sh wine
+        # (tools/apply_patches.sh fails on macOS bash 3.2 when a project has no patches: empty array + set -u)
+        run: if [ -n "$(ls patches/wine/[0-9][0-9][0-9][0-9]-*.patch 2>/dev/null)" ]; then tools/apply_patches.sh wine; else echo 'no patches/wine yet'; fi
       - name: Restore installed Wine
         id: install-cache
         uses: actions/cache/restore@v4
@@ -194,6 +195,9 @@ jobs:
         run: tools/build/macos/setup-prefix.sh
       - name: Ladder (hello-aarch64, hello-arm64ec, hello-x86_64, smoke.exe sections)
         run: tools/build/macos/run-ladder.sh
+      - name: Diagnose a hello-aarch64 that dies before printing
+        if: always()
+        run: tools/build/macos/diagnose.sh
       - name: Conformance subset (x86_64 PE tests through FEX)
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_conformance }}
         run: tools/build/macos/run-conformance.sh
@@ -231,6 +235,9 @@ jobs:
         run: tools/build/macos/setup-prefix.sh
       - name: Ladder
         run: tools/build/macos/run-ladder.sh
+      - name: Diagnose a hello-aarch64 that dies before printing
+        if: always()
+        run: tools/build/macos/diagnose.sh
       - uses: actions/upload-artifact@v4
         if: always()
         with:
