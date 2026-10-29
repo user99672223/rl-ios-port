@@ -485,7 +485,9 @@ FEX_CONFIGS = {
 
 
 def cmd_run(cases, runner, jobs, configs, quiet=False):
-    cases = pathlib.Path(cases)
+    # FEX's config parser runs with cwd=FEX_SCRIPTS, so every path handed to it is absolute.
+    cases = pathlib.Path(cases).resolve()
+    runner = str(pathlib.Path(runner).resolve())
     (cases / "fex").mkdir(exist_ok=True)
     asms = sorted(cases.glob("diff_*.asm"))
     total_fail = 0
@@ -510,6 +512,7 @@ def cmd_selftest(runner, cases=None):
     With --cases, reuse already generated cases (e.g. on an ARM64 host, which can't run the
     native x86 side); otherwise generate a fresh batch."""
     out = ROOT / "build/diff/selftest"
+    runner = str(pathlib.Path(runner).resolve())
     shutil.rmtree(out, ignore_errors=True)
     if cases:
         out.mkdir(parents=True)

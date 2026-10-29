@@ -1,0 +1,98 @@
+From 8fb0cfbe730aab5bcac212c807e8d655259d8e14 Mon Sep 17 00:00:00 2001
+From: splitwx <splitwx@local>
+Date: Thu, 29 Oct 2026 06:40:30 +0100
+Subject: [PATCH 202/206] CodeBuffer: allocate split code memory, expose
+ writable alias
+
+---
+ .../Core/SharedCodeBufferManager.cpp          | 19 +++++++++++++------
+ .../Interface/Core/SharedCodeBufferManager.h  | 15 ++++++++++++++-
+ 2 files changed, 27 insertions(+), 7 deletions(-)
+
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+index eee5023..4e6923e 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.cpp
+@@ -4,6 +4,7 @@
+ 
+ #include <FEXCore/fextl/memory.h>
+ #include <FEXCore/Utils/AllocatorHooks.h>
++#include <FEXCore/Utils/CodeMemory.h>
+ #include <FEXCore/Utils/LogManager.h>
+ #include <FEXCore/Utils/MathUtils.h>
+ 
+@@ -18,22 +19,28 @@ static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
+ 
+ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+   : AllocatedSize(Size) {
+-  Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
++  const auto Memory = FEXCore::Allocator::AllocateCodeMemory(Size);
++  Ptr = static_cast<uint8_t*>(Memory.RX);
+   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
++  RWMinusRX = reinterpret_cast<intptr_t>(Memory.RW) - reinterpret_cast<intptr_t>(Memory.RX);
+ 
+-  // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
+-  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
++  // Protect the last page of the allocated buffer to trigger SIGSEGV on write access.
++  // With split code memory only the writable alias can be written, so that is the view to protect
++  // (an executable region provided by the host generally can't be mprotected).
++  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(ToWritable(Ptr)) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
+   if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+                                           FEXCore::Allocator::ProtectOptions::None)) {
+     LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+   }
+ 
+-  if (ShouldBeNamed) {
++  if (ShouldBeNamed && !FEXCore::Allocator::IsCodeMemorySplit()) {
+     FEXCore::Allocator::VirtualName("FEXMemJIT", Ptr, Size);
+   }
+ 
+   // Huge-pages reduce the amount of iTLB misses dramatically when it works.
+-  FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
++  if (!FEXCore::Allocator::IsCodeMemorySplit()) {
++    FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
++  }
+ 
+   LookupCache = fextl::make_unique<GuestToHostMap>();
+ 
+@@ -42,7 +49,7 @@ CodeBuffer::CodeBuffer(size_t Size, bool ShouldBeNamed)
+ }
+ 
+ CodeBuffer::~CodeBuffer() {
+-  FEXCore::Allocator::VirtualFree(Ptr, AllocatedSize);
++  FEXCore::Allocator::FreeCodeMemory(Ptr, AllocatedSize);
+ }
+ 
+ SharedCodeBufferManager::SharedCodeBufferManager() {
+diff --git a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+index be7de21..9bda1c7 100644
+--- a/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
++++ b/FEXCore/Source/Interface/Core/SharedCodeBufferManager.h
+@@ -86,13 +86,26 @@ struct CodeBuffer {
+     CodeBufferOffset = Ptr;
+   }
+ 
+-  // Returns the base of the buffer.
++  // Returns the base of the buffer: the address blocks execute from (RX when W^X split).
+   uint8_t* GetBufferBase() const {
+     return Ptr;
+   }
+ 
++  // Returns the writable alias of an address inside this buffer. Code must only ever be written
++  // through this; every address stored in generated code or in FEX data stays the RX address.
++  template<typename T>
++  T* ToWritable(T* RX) const {
++    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(RX) + RWMinusRX);
++  }
++
++  // Returns the base of the writable alias.
++  uint8_t* GetBufferBaseWritable() const {
++    return ToWritable(Ptr);
++  }
++
+ private:
+   uint8_t* Ptr;
++  intptr_t RWMinusRX {}; // 0 unless code memory is split into separate RW and RX views
+   uint8_t* CodeBufferEnd;
+   size_t AllocatedSize; // including guard page; see UsableSize()
+ 

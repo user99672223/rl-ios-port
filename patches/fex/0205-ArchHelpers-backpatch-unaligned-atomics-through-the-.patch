@@ -1,0 +1,102 @@
+From f1bef91201b557eabe2a39c415219351e91a7a51 Mon Sep 17 00:00:00 2001
+From: splitwx <splitwx@local>
+Date: Thu, 29 Oct 2026 06:41:24 +0100
+Subject: [PATCH 205/206] ArchHelpers: backpatch unaligned atomics through the
+ RW alias
+
+---
+ FEXCore/Source/Utils/ArchHelpers/Arm64.cpp | 34 +++++++++++-----------
+ 1 file changed, 17 insertions(+), 17 deletions(-)
+
+diff --git a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+index 01e5bb2..940fa14 100644
+--- a/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
++++ b/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "Interface/Core/CPUBackend.h"
+ #include "Interface/Context/Context.h"
++#include <FEXCore/Utils/CodeMemory.h>
+ #include <FEXCore/Utils/SpinWaitLock.h>
+ 
+ #include <FEXCore/Debug/InternalThreadState.h>
+@@ -119,10 +120,6 @@ static constexpr uint32_t GetRmReg(uint32_t Instr) {
+   return (Instr >> RM_OFFSET) & REGISTER_MASK;
+ }
+ 
+-static void ClearICache(void* Begin, std::size_t Length) {
+-  __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
+-}
+-
+ static __uint128_t LoadAcquire128(uint64_t Addr) {
+   __uint128_t Result {};
+   uint64_t Lower;
+@@ -2103,7 +2100,10 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+   // Lock code mutex during any SIGBUS handling that potentially changes code.
+   // Due to code buffer sharing between threads, code must be carefully backpatched from last to first.
+   // Multiple threads can be attempting to handle the SIGBUS or even be executing the code being backpatched.
+-  FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(&InlineTail->SpinLockFutex);
++  // PC and InlineTail are RX addresses inside the code buffer. The futex is data written at run time
++  // and the backpatches below are code writes, so both go through the RW alias.
++  FEXCore::Utils::SpinWaitLock::UniqueSpinMutex lk(&FEXCore::Allocator::CodeMemoryToRW(InlineTail)->SpinLockFutex);
++  uint32_t* const PCW = FEXCore::Allocator::CodeMemoryToRW(PC);
+ 
+   if ((Instr & LDAXR_MASK) == LDAR_INST ||  // LDAR*
+       (Instr & LDAXR_MASK) == LDAPR_INST) { // LDAPR*
+@@ -2113,10 +2113,10 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+     LDR |= DataReg;
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+       // Ordering matters with cross-thread visibility!
+-      std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(PCW[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(LDR, std::memory_order_release);
+-    ClearICache(&PC[0], 8);
++    std::atomic_ref<uint32_t>(PCW[0]).store(LDR, std::memory_order_release);
++    FEXCore::Allocator::FlushCodeMemory(&PC[0], 8);
+     // With the instruction modified, now execute again.
+     return 0;
+   } else if ((Instr & LDAXR_MASK) == STLR_INST) { // STLR*
+@@ -2125,10 +2125,10 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+     STR |= AddrReg << 5;
+     STR |= DataReg;
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+-      std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(PCW[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(STR, std::memory_order_release);
+-    ClearICache(&PC[-1], 8);
++    std::atomic_ref<uint32_t>(PCW[0]).store(STR, std::memory_order_release);
++    FEXCore::Allocator::FlushCodeMemory(&PC[-1], 8);
+     // Back up one instruction and have another go
+     return -4;
+   } else if ((Instr & RCPC2_MASK) == LDAPUR_INST) { // LDAPUR*
+@@ -2140,10 +2140,10 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+     LDUR |= Instr & (0b1'1111'1111 << 12);
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+       // Ordering matters with cross-thread visibility!
+-      std::atomic_ref<uint32_t>(PC[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(PCW[1]).store(DMB_LD, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(LDUR, std::memory_order_release);
+-    ClearICache(&PC[0], 8);
++    std::atomic_ref<uint32_t>(PCW[0]).store(LDUR, std::memory_order_release);
++    FEXCore::Allocator::FlushCodeMemory(&PC[0], 8);
+     // With the instruction modified, now execute again.
+     return 0;
+   } else if ((Instr & RCPC2_MASK) == STLUR_INST) { // STLUR*
+@@ -2153,11 +2153,11 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
+     STUR |= DataReg;
+     STUR |= Instr & (0b1'1111'1111 << 12);
+     if (HandleType != UnalignedHandlerType::NonAtomic) {
+-      std::atomic_ref<uint32_t>(PC[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
++      std::atomic_ref<uint32_t>(PCW[-1]).store(DMB, std::memory_order_release); // Back-patch the half-barrier.
+     }
+-    std::atomic_ref<uint32_t>(PC[0]).store(STUR, std::memory_order_release);
++    std::atomic_ref<uint32_t>(PCW[0]).store(STUR, std::memory_order_release);
+ 
+-    ClearICache(&PC[-1], 8);
++    FEXCore::Allocator::FlushCodeMemory(&PC[-1], 8);
+     // Back up one instruction and have another go
+     return -4;
+   }

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Entitlements for the owner's signing tool (spec 5). get-task-allow lets StikDebug attach.
+     increased-memory-limit is applied afterwards with GetMoreRam. No extended-virtual-addressing. -->
+<plist version="1.0">
+<dict>
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>

@@ -95,3 +95,49 @@ policy says otherwise.
 open and unmerged: one commit, 22 files, about 700 changed lines, mostly x18/TEB handling in
 `dlls/ntdll/unix/signal_arm64.c` and some changes in `virtual.c`. It does not handle 16 KB pages,
 so the 4 KB protection layer (spec §6.3) is ours to write.
+
+## D-010 — JIT via StikDebug's documented breakpoint calls, our own implementation
+`runtime/jit` follows the app-side contract in StikDebug/StikJIT `INTEGRATION.md` (commit
+`3228726`, MPL-2.0) and the calling convention in StikDebug `Scripts/universal.js` (commit
+`17b1e1d`, AGPL-3.0): command in `x16`, then `brk #0xf00d`; command 1 = prepare region
+(`x0` = address or NULL to have the debugger allocate RX memory, `x1` = length, result in `x0`),
+command 0 = detach. No StikDebug or StikJIT code is copied; only the interface is implemented.
+Startup order: wait for `CS_DEBUGGED` (`csops`), detect TXM (IORegistry
+`IODeviceTree:/chosen/memory-map` property keys contain `TXM`, as StikJIT does), and on TXM
+devices prepare one region, create the RW alias with `mach_vm_remap`, then detach. Without TXM,
+the QEMU-style split mapping is used. Unknown TXM status refuses to start rather than risk a
+`brk` with no script attached, which crashes the process; `port.toml` `jit_txm` overrides it.
+Non-brk stops are forwarded to the app with their signal by the universal script, so faults still
+reach our handlers, at the cost of a debugger round trip each (spec 6.8: avoid deliberate faults).
+The owner enables JIT themselves; the app only needs the universal script selected in StikDebug.
+
+## D-011 — Device transfer: rsync over an ifuse mount, symlinks skipped
+`tools/device/*` mount the app's Documents with `ifuse <mnt> --documents <bundle-id>` and copy with
+`rsync -r --size-only --inplace --partial` (no `--delete`, no `-L`): AFC timestamps and modes are
+unreliable, and a Wine prefix holds `dosdevices/z: -> /`, so following links would copy the laptop.
+Free space comes from `ideviceinfo -q com.apple.disk_usage -k AmountDataAvailable` (key from community
+lockdownd schemas; `--skip-space-check` if it isn't numeric). `RLPORT_FAKE_DEVICE_DIR` replaces the mount
+for tests (`tests/device/run.sh`, 79 checks). Bundle id `RLPORT_BUNDLE_ID`, default `dev.rlport.app`.
+Pulled FEX code maps keep FEX's `codemap/{new,ready}/` layout (`FEXOfflineCompiler/Main.cpp:757-758`).
+
+## D-012 — FEX code maps require `ENABLECODECACHINGWIP` on the device
+FEX writes code maps only when its `ENABLECODECACHINGWIP` option is on
+(`Source/Windows/Common/ImageTracker.cpp:154`); files land at
+`<cache>codemap/new/<Name>-<fileid:016x>.<FILETIME>.bin` (`:158-164`). The runtime enables it, and the
+app's FEX cache dir is `Documents/cache/fex` (`RLPORT_DEV_FEX_CACHE_DIR` in `tools/device/lib.sh`).
+These code maps replace the spec's `cpu_miss.log` (D-007).
+
+## D-013 — Legendary embedded unmodified (0.21.1) behind `ios/legendary/bridge.py`
+Login uses `EPCAPI.get_auth_url()` in a WKWebView (authorization-code route). Launch arguments come from
+`LegendaryCore.get_launch_parameters` after `login()`, as the CLI does (`cli.py:632-636`). The bridge
+only selects Epic's "Launch without Anti-Cheat" option from cached metadata and applies D-005's `-noeac`
+row; if the option is missing there is no launch. Legendary 0.21.1 never applies `extraLaunchOption_*`
+itself (it only prints them, `cli.py:1738`), so the bridge passes the option's args the way
+`legendary launch Sugar -noeac` would. Dependencies are pinned with hashes from Legendary's `uv.lock`;
+`certifi` is the CA bundle via `REQUESTS_CA_BUNDLE` (`SSL_CERT_FILE` alone does not affect `requests`;
+tested). CPython for iOS uses the official `Apple/` build entry point (`tools/cpython/build_ios.sh`).
+
+## D-014 — Legendary's update check stays on (open for the owner)
+Legendary contacts `legendary.gl` for current client parameters by default. Leave it on; set
+`[Legendary] disable_update_check = true` in its `config.ini` to avoid that third-party contact, at the
+risk of breakage if Epic rotates client parameters.

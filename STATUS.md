@@ -6,12 +6,12 @@
 | 2. Recon | done | `tools/recon/recon.py` over 71 PE files; `docs/RECON_SUMMARY.md`; decisions D-005..D-009, risks R-003..R-005 |
 | 3. Differential test harness | done locally; ARM64 CI pending | `tests/diff/diff.py`: native x86-64 expectations, FEX `TestHarnessRunner` checks; injected-mismatch selftest passes. vixl-simulator run: 41/200 clean, MXCSR sticky flags never reported and non-default rounding modes ignored (R-006) |
 | 4. Wine ARM64EC + FEX on macOS CI | not started | |
-| 5. `rlaot` | redesigned | thin layer over FEX's disk cache and `FEXOfflineCompiler` (D-007) |
-| 6. iOS runtime | not started | |
-| 7. Graphics | not started | |
-| 8. Auth | not started | |
+| 5. `rlaot` | seed + merge done; cache generation pending (R-004) | `aot/rlaot.py` scan/seed/build/dump; FEX's own `ParseCodeMap` reads our code maps identically (`tests/aot/test_rlaot.sh`); seeding is deterministic; real game: 4 modules, 213,064 seed blocks |
+| 6. iOS runtime | app shell done; Wine iOS port not started | `ios/App` (settings, `port.toml`, logging, JIT gate, scenes), `tools/build/ios/build_app.sh`, `ios.yml` Simulator smoke test green (app launches, config written, JIT gate correct, Darwin split mapping runs generated code); `runtime/jit` links against the iOS SDK (`runtime-ios-compile.yml` green) |
+| 7. Graphics | DXMT Metal side (winemetal + airconv + LLVM 15) builds and strictly links for iOS; textures done; DXMT BC-texture integration in progress | `patches/dxmt/0001` (`dxmt-ios-compile.yml`, `airconv-ios.yml` green: only Wine's `NtSetEvent` left for runtime); shaders: DXMT's on-device cache, merged by `tools/shaders/build_bundle.py`; `runtime/textures` + `tools/textures/encode.py` (`tests/textures/run.sh`); BC6H uses RGBA16F until ASTC HDR on A16 is confirmed |
+| 8. Auth | bridge + tests done; iOS build unrun | `ios/legendary/bridge.py` (38 tests, network mocked), `ios/Auth` WKWebView login, `tools/cpython/*` + `cpython-ios.yml` (not run yet); D-013, R-010..R-013 |
 | 9. Game-derived build | not started | |
-| 10. Device tooling and docs | not started | |
+| 10. Device tooling and docs | tools + first docs done | `tools/device/{push_game,pull_logs,loop}.sh` (79 fake-device checks), `USER_GUIDE.md`, `docs/ARCHITECTURE.md` (TODO sections), `ios/App/Info.plist`; D-011, D-012 |
 
 ## Game install
 - Path: `/home/familybadgujarwilly/Games/Heroic/rocketleague` (read-only to this project)
@@ -24,3 +24,13 @@
 - No constant `PAGE_GUARD` or `MEM_WRITE_WATCH` use in game modules, and no W+X sections
 - Thread naming: the MSVC `0x406D1388` exception (2 sites in the exe); EOSSDK uses `SetThreadDescription`
 - Graphics through delay-loaded `d3d11`/`dxgi`; audio `xaudio2_9redist`; input `xinput1_3`, `dinput8`
+
+## Runtime pieces
+- `runtime/jit`: JIT region + StikDebug startup protocol + allocator (D-010). Linux tests pass
+  (`make -C tests/jit test`). Darwin backend compile-checked in CI only (no SDK on Debian).
+  FEX side done: `patches/fex/0200-0206` split W^X code memory (ARM64 CI: identical results
+  with/without split mode). Still to do: an adapter from `runtime/jit` to FEX's hook, installed in
+  the ARM64EC module before the first Context.
+- 4 KB pages: Wine already ORs 4 KB protections per host page; `runtime/prot4k` + `patches/wine/0100-0105`
+  add W^X, soft guard/write-watch, exact VirtualQuery, decommit zero-fill (tests + simulated-16K Wine run pass).
+  Native executable memory must come from `runtime/jit` (Wine's executable VirtualAlloc gets no host X).

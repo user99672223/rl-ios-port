@@ -1,0 +1,84 @@
+# DXMT's shader translator (airconv) and LLVM 15.0.7 for iOS arm64, then one link test that
+# puts airconv + LLVM + DXMT's Metal bridge (with patches/dxmt) into a single iOS dylib.
+name: airconv-ios
+
+on:
+  push:
+    branches: [main]
+    paths: ["patches/dxmt/**", "tools/build/ios/build_airconv.sh", ".github/workflows/airconv-ios.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: airconv-ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 240
+    env:
+      OUT: ${{ github.workspace }}/build/ios-deps
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch DXMT and its DirectX headers
+        run: |
+          git submodule update --init --depth 1 external/dxmt
+          git -C external/dxmt submodule update --init --depth 1 include/native/directx
+          tools/apply_patches.sh dxmt
+      - run: brew install ninja
+      # Keyed on the LLVM recipe only (the build_llvm function), so airconv-only changes reuse
+      # it; saved right after building so a later failing step doesn't discard it.
+      - name: LLVM cache key
+        id: llvm-key
+        run: echo "key=llvm-15.0.7-ios17-$(sed -n '/^build_llvm()/,/^}/p' tools/build/ios/build_airconv.sh | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - name: Restore LLVM for iOS
+        id: llvm-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: build/ios-deps/llvm-ios
+          key: ${{ steps.llvm-key.outputs.key }}
+      - name: Build LLVM 15.0.7 for iOS
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        run: tools/build/ios/build_airconv.sh llvm
+      - name: Save LLVM for iOS
+        if: steps.llvm-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: build/ios-deps/llvm-ios
+          key: ${{ steps.llvm-key.outputs.key }}
+      - name: Build airconv for iOS
+        run: tools/build/ios/build_airconv.sh airconv
+      - name: Link test (airconv + LLVM + winemetal for iOS)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd external/dxmt
+          for f in winemetal_unix cache; do
+            xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -ObjC -O1 \
+              -Iinclude -Isrc/airconv -Isrc/winemetal -Isrc/winemetal/unix \
+              -c src/winemetal/unix/$f.c -o /tmp/$f.o
+          done
+          # Library list: DXMT src/airconv/meson.build llvm_deps.
+          LLVM_LIBS="-lLLVMPasses -lLLVMTarget -lLLVMObjCARCOpts -lLLVMCoroutines -lLLVMipo -lLLVMInstrumentation \
+            -lLLVMVectorize -lLLVMLinker -lLLVMIRReader -lLLVMAsmParser -lLLVMFrontendOpenMP -lLLVMScalarOpts \
+            -lLLVMInstCombine -lLLVMAggressiveInstCombine -lLLVMTransformUtils -lLLVMBitWriter -lLLVMAnalysis \
+            -lLLVMProfileData -lLLVMSymbolize -lLLVMDebugInfoPDB -lLLVMDebugInfoMSF -lLLVMDebugInfoDWARF \
+            -lLLVMObject -lLLVMTextAPI -lLLVMMCParser -lLLVMMC -lLLVMDebugInfoCodeView -lLLVMBitReader \
+            -lLLVMCore -lLLVMRemarks -lLLVMBitstreamReader -lLLVMBinaryFormat -lLLVMSupport -lLLVMDemangle"
+          # shellcheck disable=SC2086
+          xcrun --sdk iphoneos clang++ -target arm64-apple-ios17.0 -isysroot "$SDK" -dynamiclib \
+            -install_name @rpath/winemetal.so -Wl,-U,_NtSetEvent \
+            -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
+            -framework CoreGraphics -framework UIKit -lsqlite3 \
+            /tmp/winemetal_unix.o /tmp/cache.o "$OUT/airconv/libairconv.a" \
+            -L"$OUT/llvm-ios/lib" $LLVM_LIBS -o /tmp/winemetal.so
+          ls -la /tmp/winemetal.so
+          # Only Wine's NtSetEvent may stay undefined (-U); everything else must resolve
+          # against the iOS SDK or the link fails.
+          xcrun nm -u /tmp/winemetal.so | grep -c . | xargs echo "undefined (system dylibs + NtSetEvent):"
+          xcrun otool -L /tmp/winemetal.so
+      - uses: actions/upload-artifact@v4
+        with:
+          name: airconv-ios
+          path: |
+            build/ios-deps/airconv/libairconv.a
+          retention-days: 7

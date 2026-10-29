@@ -1,0 +1,117 @@
+From 46623d6555e0db56cdaad8cf4c53b4060f364900 Mon Sep 17 00:00:00 2001
+From: RLiOS prot4k <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 06:46:25 +0100
+Subject: [PATCH 3/6] ntdll: Track which 4 KB pages hold native code so the
+ others can lose host X.
+
+Add the VPROT_NATIVE per-page bit and the VPROT_NATIVE_IMAGE per-view flag. Under the prot4k
+drop-X policy a page keeps host X only if it belongs to a builtin view, a native ARM64 image,
+or is marked in the ARM64EC code bitmap (including allocations made with
+MEM_EXTENDED_PARAMETER_EC_CODE). Pages of x86-64 images and ordinary executable allocations
+are emulated, so they are only ever read by the emulator and get no host X. This is what lets
+4 KB aligned x86-64 sections of different protections share a 16 KB host page without needing
+a writable and executable host page.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 40 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 39 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index f8ad5de..4495a53 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -139,16 +139,18 @@ struct file_view
+ #define VPROT_GUARD      0x10
+ #define VPROT_COMMITTED  0x20
+ #define VPROT_WRITEWATCH 0x40
++#define VPROT_NATIVE     0x80  /* page holds code executed natively by the host (not emulated) */
+ /* the per-page bytes are shared with the prot4k library (4 KB protections over larger host pages) */
+ C_ASSERT( VPROT_READ == P4K_READ && VPROT_WRITE == P4K_WRITE && VPROT_EXEC == P4K_EXEC );
+ C_ASSERT( VPROT_WRITECOPY == P4K_WRITECOPY && VPROT_GUARD == P4K_GUARD );
+-C_ASSERT( VPROT_COMMITTED == P4K_COMMITTED && VPROT_WRITEWATCH == P4K_WRITEWATCH );
++C_ASSERT( VPROT_COMMITTED == P4K_COMMITTED && VPROT_WRITEWATCH == P4K_WRITEWATCH && VPROT_NATIVE == P4K_NATIVE );
+ C_ASSERT( PROT_READ == P4K_HOST_READ && PROT_WRITE == P4K_HOST_WRITE && PROT_EXEC == P4K_HOST_EXEC );
+ /* per-mapping protection flags */
+ #define VPROT_ARM64EC          0x0100  /* view may contain ARM64EC code */
+ #define VPROT_SYSTEM           0x0200  /* system view (underlying mmap not under our control) */
+ #define VPROT_PLACEHOLDER      0x0400
+ #define VPROT_FREE_PLACEHOLDER 0x0800
++#define VPROT_NATIVE_IMAGE     0x1000  /* image holds native host code only (not ARM64EC / x86-64) */
+ 
+ /* Conversion from VPROT_* to Win32 flags */
+ static const BYTE VIRTUAL_Win32Flags[16] =
+@@ -1310,6 +1312,34 @@ static inline UINT64 maskbits( size_t idx )
+     return ~(UINT64)0 << (idx & 63);
+ }
+ 
++
++/***********************************************************************
++ *           update_native_bits
++ *
++ * With the drop-X policy only pages holding native code keep host X (see prot4k.h). Native
++ * code is that of builtin views, of ARM64 images, and the pages marked in the ARM64EC code
++ * map; x86-64 code is emulated and only ever read by the emulator. The bit is recomputed
++ * from the view and the map every time a range of the protection table is rewritten.
++ */
++static void update_native_bits( struct file_view *view, void *base, size_t size )
++{
++    size_t idx, end;
++
++    if (!(prot4k_policy.flags & P4K_POLICY_DROP_GUEST_X)) return;
++    if (view->protect & (VPROT_SYSTEM | VPROT_NATIVE_IMAGE))
++    {
++        set_page_vprot_bits( base, size, VPROT_NATIVE, 0 );
++        return;
++    }
++    if (!(view->protect & VPROT_ARM64EC) || !arm64ec_view) return;
++
++    idx = (size_t)base >> page_shift;
++    end = ((size_t)base + size + page_mask) >> page_shift;
++    for ( ; idx < end; idx++)
++        if (((const UINT64 *)arm64ec_view->base)[idx / 64] & ((UINT64)1 << (idx & 63)))
++            set_page_vprot_bits( (void *)(idx << page_shift), page_size, VPROT_NATIVE, 0 );
++}
++
+ /***********************************************************************
+  *           set_arm64ec_range
+  */
+@@ -2031,6 +2061,7 @@ static void set_vprot_track( struct file_view *view, void *base, size_t size, BY
+         else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
+         set_page_vprot( base, size, vprot );
+     }
++    update_native_bits( view, base, size );
+ }
+ 
+ 
+@@ -3262,6 +3293,7 @@ static NTSTATUS map_image_into_view( struct file_view *view, const UNICODE_STRIN
+         status = STATUS_NOT_SUPPORTED;
+         goto done;
+     }
++    if (nt->FileHeader.Machine == IMAGE_FILE_MACHINE_ARM64) view->protect |= VPROT_NATIVE_IMAGE;
+ 
+     /* relocate to dynamic base */
+ 
+@@ -4035,6 +4067,7 @@ NTSTATUS virtual_create_builtin_view( void *module, const UNICODE_STRING *nt_nam
+             if (sec[i].Characteristics & IMAGE_SCN_MEM_WRITE) flags |= VPROT_WRITE;
+             set_page_vprot( (char *)base + sec[i].VirtualAddress, sec[i].Misc.VirtualSize, flags );
+         }
++        update_native_bits( view, base, size );  /* builtin code is executed natively */
+ 
+         SERVER_START_REQ( map_builtin_view )
+         {
+@@ -5374,6 +5407,11 @@ static NTSTATUS allocate_virtual_memory( void **ret, SIZE_T *size_ptr, ULONG typ
+     {
+         commit_arm64ec_map( view );
+         set_arm64ec_range( base, size );
++        if (prot4k_policy.flags & P4K_POLICY_DROP_GUEST_X)  /* these pages hold native code: keep their X */
++        {
++            update_native_bits( view, base, size );
++            mprotect_range( base, size, 0, 0 );
++        }
+     }
+ 
+     if (!status) VIRTUAL_DEBUG_DUMP_VIEW( view );
+-- 
+2.47.3
+

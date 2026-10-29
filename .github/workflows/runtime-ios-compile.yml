@@ -1,0 +1,25 @@
+# Compile-checks the Apple-only runtime sources against the real iOS SDK (Debian has none).
+name: runtime-ios-compile
+
+on:
+  push:
+    branches: [main]
+    paths: ["runtime/**", ".github/workflows/runtime-ios-compile.yml"]
+  workflow_dispatch:
+
+jobs:
+  compile:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile runtime/jit for iOS device (arm64)
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          for f in runtime/jit/jit.c runtime/jit/jit_darwin.c runtime/jit/jit_fex_hooks.c; do
+            xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" \
+              -std=c11 -Wall -Wextra -Werror -c "$f" -o "/tmp/$(basename "$f").o"
+          done
+          xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -dynamiclib \
+            -framework CoreFoundation -framework IOKit -o /tmp/libjit.dylib /tmp/jit.c.o /tmp/jit_darwin.c.o /tmp/jit_fex_hooks.c.o
+          xcrun otool -L /tmp/libjit.dylib
+          xcrun nm -u /tmp/libjit.dylib | grep -E 'csops|vm_remap|IORegistry|IOObjectRelease'

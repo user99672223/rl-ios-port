@@ -1,0 +1,8 @@
+# Test-only Python packages (installed into build/venv by run.sh; never system-wide).
+# Roles: pillow = independent BCn decoder (DDS plugin); texture2ddecoder = second decoder;
+# etcpak, ispc-texcomp = two independent BC encoders for synthetic data; numpy = image math.
+numpy==2.5.4
+pillow==13.0.0
+texture2ddecoder==1.0.6
+etcpak==0.9.15
+ispc-texcomp==1.0.1

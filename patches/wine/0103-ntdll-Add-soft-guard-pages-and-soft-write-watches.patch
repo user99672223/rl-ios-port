@@ -1,0 +1,104 @@
+From c09752ba30c1094ad859add5e14713f75bdda0b2 Mon Sep 17 00:00:00 2001
+From: RLiOS prot4k <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 06:46:57 +0100
+Subject: [PATCH 4/6] ntdll: Add soft guard pages and soft write watches that
+ never fault on the host.
+
+With the prot4k softguard / softww options PAGE_GUARD and MEM_WRITE_WATCH stay pure
+bookkeeping: NtQueryVirtualMemory still reports PAGE_GUARD, but the host page stays accessible,
+so the one-shot guard exception is not raised and nothing faults (a debugger attached for JIT
+would stop on every deliberate fault). Write watches are not armed either, which means the
+written pages are unknown: NtGetWriteWatch() reports every page of the watched range and
+NtResetWriteWatch() is a no-op. That is a safe over-approximation for the usual consumers
+(garbage collectors re-scan the pages they are told about).
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 22 +++++++++++++++++-----
+ 1 file changed, 17 insertions(+), 5 deletions(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index 4495a53..6b8942e 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -262,6 +262,11 @@ static BOOL enable_write_exceptions;  /* raise exception on writes to executable
+  * With an empty policy this is exactly the stock behaviour. The policy is chosen in virtual_init(). */
+ static p4k_policy prot4k_policy = { 0x1000, 0 };
+ 
++/* Soft write watch: the watch is never armed on the host (no fault, no debugger stop). Without
++ * faults the pages written cannot be known, so NtGetWriteWatch() conservatively reports every
++ * page of the range as written, and NtResetWriteWatch() has nothing to reset. */
++static inline BOOL soft_writewatch(void) { return (prot4k_policy.flags & P4K_POLICY_SOFT_WRITEWATCH) != 0; }
++
+ struct range_entry
+ {
+     void *base;
+@@ -1908,7 +1913,7 @@ static NTSTATUS create_view( struct file_view **view_ret, void *base, size_t siz
+     view->base    = base;
+     view->size    = size;
+     view->protect = vprot;
+-    if (use_kernel_writewatch) vprot &= ~VPROT_WRITEWATCH;
++    if (use_kernel_writewatch || soft_writewatch()) vprot &= ~VPROT_WRITEWATCH;
+     set_page_vprot( base, size, vprot );
+ 
+     register_view( view );
+@@ -2050,7 +2055,7 @@ static int mprotect_range( void *base, size_t size, BYTE set, BYTE clear )
+  */
+ static void set_vprot_track( struct file_view *view, void *base, size_t size, BYTE vprot )
+ {
+-    if (!use_kernel_writewatch && view->protect & VPROT_WRITEWATCH)
++    if (!use_kernel_writewatch && !soft_writewatch() && view->protect & VPROT_WRITEWATCH)
+     {
+         /* each page may need different protections depending on write watch flag */
+         set_page_vprot_bits( base, size, vprot & ~VPROT_WRITEWATCH, ~vprot & ~VPROT_WRITEWATCH );
+@@ -2058,7 +2063,7 @@ static void set_vprot_track( struct file_view *view, void *base, size_t size, BY
+     else
+     {
+         if (enable_write_exceptions && is_vprot_exec_write( vprot )) vprot |= VPROT_WRITEWATCH;
+-        else if (use_kernel_writewatch && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
++        else if ((use_kernel_writewatch || soft_writewatch()) && view->protect & VPROT_WRITEWATCH) vprot &= ~VPROT_WRITEWATCH;
+         set_page_vprot( base, size, vprot );
+     }
+     update_native_bits( view, base, size );
+@@ -2141,6 +2146,7 @@ static void update_write_watches( void *base, size_t size, size_t accessed_size
+  */
+ static void reset_write_watches( void *base, SIZE_T size )
+ {
++    if (soft_writewatch()) return;
+     if (use_kernel_writewatch)
+     {
+         kernel_writewatch_reset( base, size );
+@@ -4810,7 +4816,8 @@ NTSTATUS virtual_handle_fault( struct thread_data *data, EXCEPTION_RECORD *rec,
+     }
+ #endif
+ 
+-    if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD))
++    if (!is_inside_signal_stack( data, stack ) && (vprot & VPROT_GUARD) &&
++        !(prot4k_policy.flags & P4K_POLICY_SOFT_GUARD))  /* soft guards are never armed on the host */
+     {
+         struct thread_stack_info stack_info;
+         if (!is_inside_thread_stack( data, page, &stack_info ))
+@@ -5213,6 +5220,11 @@ void virtual_enable_write_exceptions( BOOL enable )
+     struct file_view *view;
+     sigset_t sigset;
+ 
++    if (enable && soft_writewatch())  /* would need write faults on executable memory */
++    {
++        WARN( "write exceptions on executable memory are not supported with soft write watches\n" );
++        return;
++    }
+     server_enter_uninterrupted_section( &virtual_mutex, &sigset );
+     if (!enable_write_exceptions && enable)  /* change all existing views */
+     {
+@@ -6921,7 +6933,7 @@ NTSTATUS WINAPI NtGetWriteWatch( HANDLE process, ULONG flags, PVOID base, SIZE_T
+             size = addr - (char *)base;
+             *count = pos;
+         }
+-        if (flags & WRITE_WATCH_FLAG_RESET && (enable_write_exceptions || !use_kernel_writewatch))
++        if (flags & WRITE_WATCH_FLAG_RESET && !soft_writewatch() && (enable_write_exceptions || !use_kernel_writewatch))
+         {
+             if (use_kernel_writewatch)
+                 set_page_vprot_exec_write_protect( base, size );
+-- 
+2.47.3
+
