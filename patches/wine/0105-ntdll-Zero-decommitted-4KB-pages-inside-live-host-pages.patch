@@ -1,0 +1,59 @@
+From e331e6be8e5f7dd0cb143ffe114431e24fab2686 Mon Sep 17 00:00:00 2001
+From: RLiOS prot4k <noreply@anthropic.com>
+Date: Thu, 29 Oct 2026 06:47:37 +0100
+Subject: [PATCH 6/6] ntdll: Zero 4 KB pages that are decommitted inside a host
+ page that stays mapped.
+
+Windows returns zero-filled pages when decommitted memory is committed again. With 4 KB pages
+that holds because the page is replaced; with a larger host page the 4 KB parts that share a host
+page with committed parts cannot be replaced and kept their old contents, which then reappeared
+on the next MEM_COMMIT. Zero them at decommit time (the host page is made writable only for that
+and gets its new protection right after), so every uncommitted 4 KB page always reads as zero.
+
+Also size the replaced range of a whole-view MEM_DECOMMIT (size 0) in whole host pages: it used
+the 4 KB view size, which trips the anon_mmap_fixed() alignment assertion for views smaller than
+a host page multiple.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>
+---
+ dlls/ntdll/unix/virtual.c | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/dlls/ntdll/unix/virtual.c b/dlls/ntdll/unix/virtual.c
+index e3f6d47..1d1f9dd 100644
+--- a/dlls/ntdll/unix/virtual.c
++++ b/dlls/ntdll/unix/virtual.c
+@@ -2561,15 +2561,29 @@ static NTSTATUS decommit_pages( struct file_view *view, char *base, size_t size
+ {
+     char *host_end, *host_start = (char *)ROUND_SIZE( 0, base, host_page_mask );
+ 
++    BOOL head_partial, tail_partial;
++
+     if (!size)
+     {
+         size = view->size;
+-        host_end = host_start + view->size;
++        host_end = host_start + ROUND_SIZE( 0, view->size, host_page_mask );
+     }
+     else host_end = ROUND_ADDR( base + size, host_page_mask );
+ 
++    head_partial = ((UINT_PTR)base & host_page_mask) != 0;
++    tail_partial = ((UINT_PTR)(base + size) & host_page_mask) != 0;
++
++    /* Windows hands out zero-filled pages when decommitted memory is committed again. Host pages
++     * that are entirely decommitted are replaced below, but the 4 KB pages that share a host page
++     * with pages that stay committed cannot be discarded: zero them now. */
++    if (head_partial || tail_partial) p4k_zero_partial( &prot4k_policy, &prot4k_host, (uintptr_t)base, size );
++
+     if (host_start < host_end) anon_mmap_fixed( host_start, host_end - host_start, PROT_NONE, 0 );
+     set_page_vprot_bits( base, size, 0, VPROT_COMMITTED );
++    /* the partially covered host pages were made writable to zero them: apply their new union */
++    if (head_partial) mprotect_range( base, 1, 0, 0 );
++    if (tail_partial && ROUND_ADDR( base + size - 1, host_page_mask ) != ROUND_ADDR( base, host_page_mask ))
++        mprotect_range( base + size - 1, 1, 0, 0 );
+     if (host_start < host_end) kernel_writewatch_register_range( view, host_start, host_end - host_start );
+     return STATUS_SUCCESS;
+ }
+-- 
+2.47.3
+
