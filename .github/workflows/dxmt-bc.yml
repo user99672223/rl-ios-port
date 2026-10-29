@@ -184,7 +184,10 @@ jobs:
         run: |
           cmake -G Ninja -S external/astc-encoder -B build/astcenc -DCMAKE_BUILD_TYPE=Release -DASTCENC_ISA_NEON=ON -DASTCENC_CLI=ON -DASTCENC_WERROR=OFF
           cmake --build build/astcenc
-          cmake -G Ninja -S runtime/textures -B build/rltex -DCMAKE_BUILD_TYPE=Release -DRLTEX_BCDEC_DIR="$PWD/external/bcdec"
+          # rltex is built with -Werror and clang flags its encode worker as unused unless astc-encoder is linked in,
+          # so link it (also what the on-device library will do); the CLI is what encode.py drives.
+          cmake -G Ninja -S runtime/textures -B build/rltex -DCMAKE_BUILD_TYPE=Release -DRLTEX_BCDEC_DIR="$PWD/external/bcdec" \
+            -DRLTEX_ASTCENC_INCLUDE="$PWD/external/astc-encoder/Source" -DRLTEX_ASTCENC_LIB="$PWD/build/astcenc/Source/libastcenc-neon-static.a"
           cmake --build build/rltex
           ls build/astcenc/Source/astcenc-neon build/rltex/rltex
       - name: Metal device (what DXMT will see)
