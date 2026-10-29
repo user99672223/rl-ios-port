@@ -12,10 +12,10 @@ index 2c037f8..2cffb6f 100644
  
 diff --git a/src/winemetal/unix/bc_emul.c b/src/winemetal/unix/bc_emul.c
 new file mode 100644
-index 0000000..b97dcaa
+index 0000000..09cabc8
 --- /dev/null
 +++ b/src/winemetal/unix/bc_emul.c
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,196 @@
 +/*
 + * BC texture emulation bridge: unix side (patches/dxmt/0100).
 + *
@@ -56,24 +56,25 @@ index 0000000..b97dcaa
 +
 +static pthread_once_t g_once = PTHREAD_ONCE_INIT;
 +static rltex_ctx *g_ctx;
++static rltex_config g_cfg;
 +static int g_log;
 +
 +static void
 +bc_emul_init(void) {
-+  rltex_config cfg;
++  rltex_config *cfg_p = &g_cfg;
 +  const char *root = getenv("DXMT_BC_CACHE_DIR");
 +  const char *conf = getenv("DXMT_BC_CONFIG");
 +  const char *log = getenv("DXMT_BC_LOG");
 +  g_log = log && log[0] == '1';
 +
-+  rltex_config_defaults(&cfg);
++  rltex_config_defaults(cfg_p);
 +  /* BC6H -> ASTC HDR needs MTLPixelFormatASTC_*_HDR; availability on the A16 is not confirmed
 +     (docs/notes/textures.md section 3). Default to the decoded RGBA16F upload, a config file
 +     with `astc_bc6h_mode = "astc_hdr"` opts in. */
-+  cfg.bc6h_astc_hdr = 0;
++  cfg_p->bc6h_astc_hdr = 0;
 +  if (conf && conf[0]) {
 +    char err[512] = {0};
-+    int bad = rltex_config_load_file(&cfg, conf, err, sizeof err);
++    int bad = rltex_config_load_file(cfg_p, conf, err, sizeof err);
 +    if (bad < 0)
 +      fprintf(stderr, "bc-emul: cannot read %s: %s\n", conf, rltex_status_string(bad));
 +    else if (bad)
@@ -81,10 +82,10 @@ index 0000000..b97dcaa
 +  }
 +  /* No astc-encoder linked in here: the library would ignore this anyway. The offline
 +     encoder (tools/textures/encode.py) is what turns saved .bc blobs into .astc files. */
-+  cfg.background_encode = 0;
++  cfg_p->background_encode = 0;
 +
 +  if (root && root[0]) {
-+    int r = rltex_ctx_create(root, &cfg, &g_ctx);
++    int r = rltex_ctx_create(root, cfg_p, &g_ctx);
 +    if (r != RLTEX_OK) {
 +      fprintf(stderr, "bc-emul: cache disabled, rltex_ctx_create(%s) failed: %s\n", root, rltex_status_string(r));
 +      g_ctx = NULL;
@@ -158,13 +159,22 @@ index 0000000..b97dcaa
 +      info->source = WMTBCEmulSourceDecoded;
 +      info->pixfmt = (uint32_t)tex.pixfmt;
 +    }
-+    if (g_log)
++    if (g_log) {
++      /* HIT: ASTC from the cache. MISS: decoded, .bc blob saved and miss logged (once per key and
++         process). NOASTC: this format has no ASTC mapping (SNORM, BC6H unless configured), decoded
++         without touching the cache files. */
++      rltex_bc_info bi;
++      rltex_astc_params ap;
++      const char *what = "NOASTC";
++      if (info->source == WMTBCEmulSourceAstc)
++        what = "HIT";
++      else if (rltex_bc_info_for_dxgi(desc.dxgi_format, &bi) == RLTEX_OK && rltex_astc_params_for(&g_cfg, &bi, &ap) == RLTEX_OK)
++        what = "MISS";
 +      fprintf(
-+          stderr, "bc-emul: %s key=%s dxgi=%u %ux%u mip=%u slice=%u%s\n",
-+          info->source == WMTBCEmulSourceAstc ? "HIT " : "MISS", tex.key, desc.dxgi_format, desc.width, desc.height,
-+          desc.mip_level, desc.array_slice,
-+          info->source == WMTBCEmulSourceAstc ? "" : (tex.queued_for_encode ? " (queued)" : "")
++          stderr, "bc-emul: %s key=%s dxgi=%u %ux%u mip=%u slice=%u\n", what, tex.key, desc.dxgi_format, desc.width,
++          desc.height, desc.mip_level, desc.array_slice
 +      );
++    }
 +    rltex_tex_release(&tex);
 +    return STATUS_SUCCESS;
 +  }

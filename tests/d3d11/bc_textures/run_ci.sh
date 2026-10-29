@@ -89,6 +89,11 @@ expect_ok() { # NAME
   [ "$2" = "0" ] || fail "$name: exit status $2"
 }
 
+# 0. diagnostics (informational, never counted): the pipeline self-test alone, with the Metal API
+#    validation layer and DXMT's debug log, with and without waiting for the GPU before each readback
+run diag-selftest "MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 DXMT_LOG_LEVEL=debug" --filter nomatch || true
+run diag-selftest-sync "MTL_DEBUG_LAYER=1 DXMT_LOG_LEVEL=debug" --filter nomatch --sync || true
+
 # 1. native BC on the GPU
 run native "" ; expect_ok native $?
 

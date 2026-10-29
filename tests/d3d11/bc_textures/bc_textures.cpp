@@ -8,9 +8,10 @@
 // block-compression rules give for those blocks. One PASS / FAIL line per format x path; the exit
 // status is the number of failures.
 //
-//   bc_textures.exe [--flat] [--tol N] [--filter SUBSTRING] [--variants ABC] [--verbose]
+//   bc_textures.exe [--flat] [--tol N] [--filter SUBSTRING] [--variants ABC] [--sync] [--verbose]
 //     --flat    one colour per subresource (the ASTC cache run: ASTC reproduces it within a few levels)
 //     --tol N   allowed |difference| per channel (default 3, 8 with --flat)
+//     --sync    wait for the GPU with an event query before every readback (diagnostics)
 //     --variants  sizes to run: A 8x8 (4 mips), B 10x6 (4 mips, not a multiple of 4), C 2x2 (2 mips)
 //
 // Paths (see docs/notes/dxmt-bc.md for the DXMT code each one exercises):
@@ -50,6 +51,7 @@ static ID3D11Buffer *g_vb;
 static ID3D11RasterizerState *g_rs;
 static bool g_flat = false;
 static bool g_verbose = false;
+static bool g_sync = false;  // --sync: wait for the GPU (event query) before every readback
 static int g_tol = -1;
 static std::string g_variants_sel = "ABC";  // --variants: which sizes to run (A 8x8, B 10x6, C 2x2)
 
@@ -119,6 +121,22 @@ static D3D11_TEXTURE2D_DESC make_desc(const FormatInfo &fi, const VariantInfo &v
 // ------------------------------------------------------------------------------------------
 // verification: draw a mip, read it back, compare
 // ------------------------------------------------------------------------------------------
+// Blocks until the GPU has executed everything submitted so far (event query).
+static void wait_idle() {
+  D3D11_QUERY_DESC qd = {D3D11_QUERY_EVENT, 0};
+  ID3D11Query *q = nullptr;
+  if (FAILED(g_dev->CreateQuery(&qd, &q)))
+    return;
+  g_ctx->End(q);
+  g_ctx->Flush();
+  BOOL done = FALSE;
+  for (int i = 0; i < 20000 && !done; i++) {
+    if (g_ctx->GetData(q, &done, sizeof done, 0) != S_OK)
+      Sleep(1);
+  }
+  q->Release();
+}
+
 static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, const SubVec &sv, std::string &err) {
   const int tol = g_tol >= 0 ? g_tol : (g_flat ? 8 : 3);
   HRESULT hr;
@@ -181,6 +199,8 @@ static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, con
   g_ctx->PSSetShaderResources(0, 1, none);
   g_ctx->OMSetRenderTargets(0, nullptr, nullptr);
   g_ctx->CopyResource(stg, rt);
+  if (g_sync)
+    wait_idle();
 
   D3D11_MAPPED_SUBRESOURCE m;
   if (FAILED(hr = g_ctx->Map(stg, 0, D3D11_MAP_READ, 0, &m))) {
@@ -213,39 +233,47 @@ static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, con
   return ok;
 }
 
-// Pipeline self-test with an ordinary RGBA8 texture: if this fails, the draw / readback machinery
-// (shaders, render target, staging) is at fault, not the BC support.
+// Pipeline self-test with an ordinary RGBA8 texture of four mips (8x8 .. 1x1): if this fails, the draw /
+// readback machinery or the device's mip views are at fault, not the BC support.
 static bool selftest_rgba8(std::string &err) {
-  const UINT w = 6, h = 5;
-  std::vector<uint8_t> px(w * h * 4);
-  std::vector<uint8_t> exp(w * h * 4);
-  for (UINT y = 0; y < h; y++)
-    for (UINT x = 0; x < w; x++) {
-      uint8_t *p = &px[(y * w + x) * 4];
-      p[0] = (uint8_t)(x * 40 + 5);
-      p[1] = (uint8_t)(y * 50 + 9);
-      p[2] = (uint8_t)(x * y * 7);
-      p[3] = (uint8_t)(255 - x - y);
-    }
-  exp = px;
+  const UINT mips = 4;
+  std::vector<std::vector<uint8_t>> px(mips);
+  std::vector<D3D11_SUBRESOURCE_DATA> sd(mips);
+  for (UINT m = 0; m < mips; m++) {
+    UINT w = 8 >> m, h = 8 >> m;
+    px[m].resize(w * h * 4);
+    for (UINT y = 0; y < h; y++)
+      for (UINT x = 0; x < w; x++) {
+        uint8_t *p = &px[m][(y * w + x) * 4];
+        p[0] = (uint8_t)(x * 30 + 10 + m * 50);
+        p[1] = (uint8_t)(y * 25 + 9);
+        p[2] = (uint8_t)(m * 60 + x + y);
+        p[3] = (uint8_t)(255 - x - y);
+      }
+    sd[m] = {px[m].data(), w * 4, 0};
+  }
   D3D11_TEXTURE2D_DESC d = {};
-  d.Width = w;
-  d.Height = h;
-  d.MipLevels = d.ArraySize = 1;
+  d.Width = d.Height = 8;
+  d.MipLevels = mips;
+  d.ArraySize = 1;
   d.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
   d.SampleDesc.Count = 1;
   d.Usage = D3D11_USAGE_DEFAULT;
   d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-  D3D11_SUBRESOURCE_DATA sd = {px.data(), w * 4, 0};
   Ref<ID3D11Texture2D> tex;
-  HRESULT hr = g_dev->CreateTexture2D(&d, &sd, &tex);
+  HRESULT hr = g_dev->CreateTexture2D(&d, sd.data(), &tex);
   if (FAILED(hr)) {
     err = "CreateTexture2D " + hr_str(hr);
     return false;
   }
   FormatInfo fi = {"RGBA8", DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 4, 0};
-  SubVec sv = {px.data(), (unsigned)px.size(), exp.data(), w, h};
-  return verify_mip(tex, fi, 0, sv, err);
+  for (UINT m = 0; m < mips; m++) {
+    UINT w = 8 >> m, h = 8 >> m;
+    SubVec sv = {px[m].data(), (unsigned)px[m].size(), px[m].data(), w, h};
+    if (!verify_mip(tex, fi, m, sv, err))
+      return false;
+  }
+  return true;
 }
 
 static bool verify_all(ID3D11Texture2D *tex, const FormatInfo &fi, const VariantInfo &vi, UINT vidx, UINT mips, const SubVec (*vec)[4],
@@ -587,6 +615,8 @@ int main(int argc, char **argv) {
       g_flat = true;
     else if (!strcmp(argv[i], "--verbose"))
       g_verbose = true;
+    else if (!strcmp(argv[i], "--sync"))
+      g_sync = true;
     else if (!strcmp(argv[i], "--tol") && i + 1 < argc)
       g_tol = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--filter") && i + 1 < argc)
@@ -594,7 +624,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--variants") && i + 1 < argc)
       g_variants_sel = argv[++i];
     else {
-      printf("usage: bc_textures [--flat] [--tol N] [--filter S] [--variants ABC] [--verbose]\n");
+      printf("usage: bc_textures [--flat] [--tol N] [--filter S] [--variants ABC] [--sync] [--verbose]\n");
       return 2;
     }
   }
@@ -606,13 +636,13 @@ int main(int argc, char **argv) {
     return 1;
 
   int failures = 0, total = 0;
-  {
+  for (int rep = 1; rep <= 3; rep++) {
     std::string err;
     total++;
     if (selftest_rgba8(err)) {
-      printf("PASS selftest rgba8-load\n");
+      printf("PASS selftest rgba8-mips-%d\n", rep);
     } else {
-      printf("FAIL selftest rgba8-load: %s\n", err.c_str());
+      printf("FAIL selftest rgba8-mips-%d: %s\n", rep, err.c_str());
       failures++;
     }
   }
