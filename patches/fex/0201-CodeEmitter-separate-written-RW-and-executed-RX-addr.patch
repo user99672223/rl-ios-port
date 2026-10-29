@@ -1,0 +1,171 @@
+From 1e44ad6f14f08e403a3acaae0b143ada6851974d Mon Sep 17 00:00:00 2001
+From: splitwx <splitwx@local>
+Date: Thu, 29 Oct 2026 06:40:25 +0100
+Subject: [PATCH 201/206] CodeEmitter: separate written (RW) and executed (RX)
+ addresses in Buffer
+
+---
+ CodeEmitter/CodeEmitter/Buffer.h  | 32 ++++++++++++++++++++++++-----
+ CodeEmitter/CodeEmitter/Emitter.h | 34 ++++++++++++++++++++-----------
+ 2 files changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/CodeEmitter/CodeEmitter/Buffer.h b/CodeEmitter/CodeEmitter/Buffer.h
+index 602eeb6..a3afb9d 100644
+--- a/CodeEmitter/CodeEmitter/Buffer.h
++++ b/CodeEmitter/CodeEmitter/Buffer.h
+@@ -12,14 +12,20 @@ public:
+     SetBuffer(nullptr, 0);
+   }
+ 
+-  Buffer(uint8_t* Base, uint64_t BaseSize) {
+-    SetBuffer(Base, BaseSize);
++  // `Base` is where bytes are written. For a W^X split code buffer, `Base` is the writable (RW)
++  // alias and `RXBias` is (executable address - RW address), a constant for the whole buffer.
++  // Every address the emitter hands out or embeds in code (GetCursorAddress, GetBufferBase,
++  // label locations) is an executable (RX) address, so branch offsets, adr/literal targets and
++  // return addresses are correct for where the code will run. RXBias is 0 for ordinary buffers.
++  Buffer(uint8_t* Base, uint64_t BaseSize, intptr_t RXBias = 0) {
++    SetBuffer(Base, BaseSize, RXBias);
+   }
+ 
+-  void SetBuffer(uint8_t* Base, uint64_t BaseSize) {
++  void SetBuffer(uint8_t* Base, uint64_t BaseSize, intptr_t RXBias = 0) {
+     BufferBase = Base;
+     CurrentOffset = BufferBase;
+     Size = BaseSize;
++    this->RXBias = RXBias;
+   }
+ 
+   template<typename T>
+@@ -57,11 +63,20 @@ public:
+     CurrentOffset += Size - CurrentAlignment;
+   }
+ 
++  // Executable address of the cursor.
+   template<typename T>
+   T GetCursorAddress() const {
+-    return reinterpret_cast<T>(CurrentOffset);
++    return reinterpret_cast<T>(CurrentOffset + RXBias);
+   }
+ 
++  // Translate an executable address inside this buffer to the address that can be written.
++  template<typename T>
++  T* ToWritable(T* ExecAddress) const {
++    return reinterpret_cast<T*>(reinterpret_cast<uintptr_t>(ExecAddress) - static_cast<uintptr_t>(RXBias));
++  }
++
++  // Only valid for buffers where the written and executed addresses are the same (RXBias == 0).
++  // Split buffers must use FEXCore::Allocator::FlushCodeMemory.
+   static void ClearICache(void* Begin, std::size_t Length) {
+     __builtin___clear_cache(static_cast<char*>(Begin), static_cast<char*>(Begin) + Length);
+   }
+@@ -70,7 +85,13 @@ public:
+     return static_cast<size_t>(CurrentOffset - BufferBase);
+   }
+ 
++  // Executable address of the start of the buffer.
+   uint8_t* GetBufferBase() const {
++    return BufferBase + RXBias;
++  }
++
++  // Writable address of the start of the buffer.
++  uint8_t* GetBufferBaseWritable() const {
+     return BufferBase;
+   }
+ 
+@@ -88,7 +109,7 @@ public:
+ 
+   template<typename T>
+   size_t GetCursorOffsetFromAddress(const T* Address) const {
+-    return static_cast<size_t>(reinterpret_cast<const uint8_t*>(Address) - BufferBase);
++    return static_cast<size_t>(reinterpret_cast<const uint8_t*>(Address) - (BufferBase + RXBias));
+   }
+ 
+ protected:
+@@ -96,5 +117,6 @@ protected:
+   uint8_t* BufferBase;
+   uint8_t* CurrentOffset;
+   uint64_t Size;
++  intptr_t RXBias {};
+ };
+ } // namespace ARMEmitter
+diff --git a/CodeEmitter/CodeEmitter/Emitter.h b/CodeEmitter/CodeEmitter/Emitter.h
+index 001adcb..e6a7f16 100644
+--- a/CodeEmitter/CodeEmitter/Emitter.h
++++ b/CodeEmitter/CodeEmitter/Emitter.h
+@@ -642,8 +642,8 @@ class Emitter : public ARMEmitter::Buffer {
+ public:
+   Emitter() = default;
+ 
+-  Emitter(uint8_t* Base, uint64_t BaseSize)
+-    : Buffer(Base, BaseSize) {}
++  Emitter(uint8_t* Base, uint64_t BaseSize, intptr_t RXBias = 0)
++    : Buffer(Base, BaseSize, RXBias) {}
+ 
+   // Bind a backward label to an address.
+   // Address that is bound is the current emitter location.
+@@ -660,8 +660,10 @@ public:
+     // Patch up the instructions
+     switch (Label->Type) {
+     case ForwardLabel::InstType::ADR: {
+-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
+-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
++      uint32_t* InstructionExec = reinterpret_cast<uint32_t*>(Label->Location);
++      // The instruction is patched through its writable alias; offsets use its executable address.
++      uint32_t* Instruction = ToWritable(InstructionExec);
++      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(InstructionExec);
+       if (!IsADRRange(Imm)) {
+         // Can't bind.
+         return false;
+@@ -675,8 +677,10 @@ public:
+       break;
+     }
+     case ForwardLabel::InstType::ADRP: {
+-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
+-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
++      uint32_t* InstructionExec = reinterpret_cast<uint32_t*>(Label->Location);
++      // The instruction is patched through its writable alias; offsets use its executable address.
++      uint32_t* Instruction = ToWritable(InstructionExec);
++      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(InstructionExec);
+ 
+       if (!(IsADRPRange(Imm) && IsADRPAligned(Imm))) {
+         // Can't bind.
+@@ -693,8 +697,10 @@ public:
+       break;
+     }
+     case ForwardLabel::InstType::B: {
+-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
+-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
++      uint32_t* InstructionExec = reinterpret_cast<uint32_t*>(Label->Location);
++      // The instruction is patched through its writable alias; offsets use its executable address.
++      uint32_t* Instruction = ToWritable(InstructionExec);
++      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(InstructionExec);
+       if (!(Imm >= -134217728 && Imm <= 134217724 && ((Imm & 0b11) == 0))) {
+         // Can't bind.
+         return false;
+@@ -709,8 +715,10 @@ public:
+       break;
+     }
+     case ForwardLabel::InstType::TEST_BRANCH: {
+-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
+-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
++      uint32_t* InstructionExec = reinterpret_cast<uint32_t*>(Label->Location);
++      // The instruction is patched through its writable alias; offsets use its executable address.
++      uint32_t* Instruction = ToWritable(InstructionExec);
++      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(InstructionExec);
+       if (!(Imm >= -32768 && Imm <= 32764 && ((Imm & 0b11) == 0))) {
+         // Can't bind.
+         return false;
+@@ -726,8 +734,10 @@ public:
+     }
+     case ForwardLabel::InstType::BC:
+     case ForwardLabel::InstType::RELATIVE_LOAD: {
+-      uint32_t* Instruction = reinterpret_cast<uint32_t*>(Label->Location);
+-      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(Instruction);
++      uint32_t* InstructionExec = reinterpret_cast<uint32_t*>(Label->Location);
++      // The instruction is patched through its writable alias; offsets use its executable address.
++      uint32_t* Instruction = ToWritable(InstructionExec);
++      int64_t Imm = reinterpret_cast<int64_t>(CurrentAddress) - reinterpret_cast<int64_t>(InstructionExec);
+       if (!(Imm >= -1048576 && Imm <= 1048575 && ((Imm & 0b11) == 0))) {
+         // Can't bind.
+         return false;

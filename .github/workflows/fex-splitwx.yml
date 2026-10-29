@@ -1,0 +1,146 @@
+# W^X split for FEX's JIT (patches/fex/02xx-*): builds FEX natively on ARM64 with the patches applied and
+# runs FEX's 64-bit ASM tests with and without FEX_TEST_SPLITWX=1. In split mode every code buffer is a memfd
+# mapped twice (RX view read+exec only, RW view read+write only), so a code write that bypasses the RW alias, or
+# a fetch from the RW alias, faults. The two runs must have identical per-test results.
+# Synthetic code only; nothing from the game is used here.
+name: fex-splitwx
+
+on:
+  push:
+    branches: [wip/fex-splitwx]
+  workflow_dispatch:
+    inputs:
+      count:
+        description: Differential cases
+        default: "200"
+
+jobs:
+  diff-cases:
+    name: Generate differential cases (native x86-64)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nasm
+      - name: Generate cases with native expectations
+        run: python3 tests/diff/diff.py gen --seed ci --count "${{ inputs.count || '200' }}" --out build/diff/cases
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diff-cases
+          path: build/diff/cases/
+          retention-days: 7
+
+  fex-arm64-splitwx:
+    name: FEX ASM tests on ARM64, with and without split W^X
+    needs: diff-cases
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch FEX and the submodules its build needs
+        run: |
+          git submodule update --init --depth 1 external/fex
+          cd external/fex
+          git submodule update --init --depth 1 External/vixl Source/Common/cpp-optparse External/fmt \
+            External/xxhash External/Catch2 External/range-v3 External/unordered_dense External/rpmalloc \
+            External/jemalloc_glibc External/drm-headers External/tracy External/zydis External/Vulkan-Headers
+      - name: Install tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang lld ninja-build nasm cmake python3
+      - name: Apply FEX patches (patches/fex)
+        run: |
+          tools/apply_patches.sh --check
+          tools/apply_patches.sh fex
+          git -C external/fex diff --stat
+      - name: Configure FEX
+        run: >
+          cmake -S external/fex -B build/fex -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DENABLE_LTO=OFF -DBUILD_TESTING=ON
+          -DBUILD_FEXCONFIG=OFF -DENABLE_OFFLINE_TELEMETRY=OFF -DTUNE_CPU=generic
+      - name: Build FEX test runner and ASM tests
+        run: ninja -C build/fex TestHarnessRunner asm_files
+      - name: Kernel facts
+        run: |
+          uname -a
+          python3 -c "import mmap,os; print('memfd_create available:', hasattr(os, 'memfd_create'))"
+          cat /proc/sys/vm/overcommit_memory
+      - name: ASM tests, default RWX code buffers
+        run: |
+          cd build/fex
+          ctest --timeout 302 -j"$(nproc)" -R '.*64Bit.*.asm$' --output-junit "$GITHUB_WORKSPACE/build/asm-default.xml" | tee "$GITHUB_WORKSPACE/build/asm-default.log" | tail -n 25
+      - name: ASM tests, split W^X (FEX_TEST_SPLITWX=1)
+        run: |
+          cd build/fex
+          FEX_TEST_SPLITWX=1 ctest --timeout 302 -j"$(nproc)" -R '.*64Bit.*.asm$' --output-junit "$GITHUB_WORKSPACE/build/asm-split.xml" | tee "$GITHUB_WORKSPACE/build/asm-split.log" | tail -n 25
+      - name: Prove the split mode is active (code buffers are two memfd views)
+        run: |
+          sudo apt-get install -y -qq strace
+          cd build/fex
+          t=$(ls unittests/ASM/*.asm.bin 2>/dev/null | head -1)
+          echo "test binary: $t"
+          FEX_TEST_SPLITWX=1 strace -f -e trace=memfd_create,mmap Bin/TestHarnessRunner "$t" "${t%.bin}.config.bin" 2>&1 | grep -E 'memfd_create|MAP_SHARED' | head -8
+      - name: Compare per-test results (must be identical)
+        run: |
+          cat > build/cmpjunit.py <<'EOF'
+          import sys, xml.etree.ElementTree as ET
+          from collections import Counter
+          def load(p):
+              r = {}
+              for tc in ET.parse(p).getroot().iter("testcase"):
+                  r[tc.get("name")] = "fail" if tc.find("failure") is not None else "skipped" if tc.find("skipped") is not None else "pass"
+              return r
+          a, b = load(sys.argv[1]), load(sys.argv[2])
+          print(sys.argv[1], dict(Counter(a.values())), len(a))
+          print(sys.argv[2], dict(Counter(b.values())), len(b))
+          diff = [(k, a.get(k), b.get(k)) for k in sorted(set(a) | set(b)) if a.get(k) != b.get(k)]
+          print("differing tests:", len(diff))
+          for d in diff[:40]: print("  ", d)
+          sys.exit(1 if diff or not a else 0)
+          EOF
+          python3 build/cmpjunit.py build/asm-default.xml build/asm-split.xml
+      - uses: actions/download-artifact@v4
+        with:
+          name: diff-cases
+          path: build/diff/cases
+      - name: Differential tests, default
+        run: python3 tests/diff/diff.py run --cases build/diff/cases --runner build/fex/Bin/TestHarnessRunner || true
+      - name: Save default differential report
+        run: cp build/diff/cases/report.json build/diff-report-default.json
+      - name: Differential tests, split W^X
+        run: FEX_TEST_SPLITWX=1 python3 tests/diff/diff.py run --cases build/diff/cases --runner build/fex/Bin/TestHarnessRunner || true
+      - name: Differential reports must match
+        run: |
+          python3 - <<'EOF'
+          import json
+          a = json.load(open("build/diff-report-default.json"))
+          b = json.load(open("build/diff/cases/report.json"))
+          ok = True
+          for cfg in a:
+              same = sorted(a[cfg]["fail"]) == sorted(b[cfg]["fail"]) and a[cfg]["cases"] == b[cfg]["cases"]
+              print(cfg, "cases", a[cfg]["cases"], "fail default", len(a[cfg]["fail"]), "fail split", len(b[cfg]["fail"]), "same" if same else "DIFFERENT")
+              ok &= same
+          raise SystemExit(0 if ok else 1)
+          EOF
+      - name: "Negative self-check: write one code site through RX, split mode must fail"
+        run: |
+          f=external/fex/FEXCore/Source/Interface/Core/JIT/JIT.cpp
+          grep -n 'memcpy(CurrentCodeBuffer->ToWritable(AllocatedInfo.BufferAllocationOffset), TempCodeBuffer' "$f"
+          sed -i 's#memcpy(CurrentCodeBuffer->ToWritable(AllocatedInfo.BufferAllocationOffset), TempCodeBuffer#memcpy(AllocatedInfo.BufferAllocationOffset, TempCodeBuffer#' "$f"
+          ninja -C build/fex TestHarnessRunner
+          cd build/fex
+          set +e
+          FEX_TEST_SPLITWX=1 ctest --timeout 60 -j"$(nproc)" -R 'Test_64Bit_(ALU|Atomics|CALL)' > ../neg-split.log 2>&1
+          split_rc=$?
+          ctest --timeout 60 -j"$(nproc)" -R 'Test_64Bit_(ALU|Atomics|CALL)' > ../neg-default.log 2>&1
+          default_rc=$?
+          tail -n 4 ../neg-split.log ../neg-default.log
+          echo "split rc=$split_rc (must be non-zero), default rc=$default_rc (must be zero)"
+          [ "$split_rc" -ne 0 ] && [ "$default_rc" -eq 0 ]
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: splitwx-reports
+          path: |
+            build/asm-*.xml
+            build/asm-*.log
+            build/neg-*.log
+            build/diff-report-default.json
+            build/diff/cases/report.json
