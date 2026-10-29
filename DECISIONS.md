@@ -95,3 +95,18 @@ policy says otherwise.
 open and unmerged: one commit, 22 files, about 700 changed lines, mostly x18/TEB handling in
 `dlls/ntdll/unix/signal_arm64.c` and some changes in `virtual.c`. It does not handle 16 KB pages,
 so the 4 KB protection layer (spec §6.3) is ours to write.
+
+## D-010 — JIT via StikDebug's documented breakpoint calls, our own implementation
+`runtime/jit` follows the app-side contract in StikDebug/StikJIT `INTEGRATION.md` (commit
+`3228726`, MPL-2.0) and the calling convention in StikDebug `Scripts/universal.js` (commit
+`17b1e1d`, AGPL-3.0): command in `x16`, then `brk #0xf00d`; command 1 = prepare region
+(`x0` = address or NULL to have the debugger allocate RX memory, `x1` = length, result in `x0`),
+command 0 = detach. No StikDebug or StikJIT code is copied; only the interface is implemented.
+Startup order: wait for `CS_DEBUGGED` (`csops`), detect TXM (IORegistry
+`IODeviceTree:/chosen/memory-map` property keys contain `TXM`, as StikJIT does), and on TXM
+devices prepare one region, create the RW alias with `mach_vm_remap`, then detach. Without TXM,
+the QEMU-style split mapping is used. Unknown TXM status refuses to start rather than risk a
+`brk` with no script attached, which crashes the process; `port.toml` `jit_txm` overrides it.
+Non-brk stops are forwarded to the app with their signal by the universal script, so faults still
+reach our handlers, at the cost of a debugger round trip each (spec 6.8: avoid deliberate faults).
+The owner enables JIT themselves; the app only needs the universal script selected in StikDebug.

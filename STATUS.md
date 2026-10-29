@@ -24,3 +24,8 @@
 - No constant `PAGE_GUARD` or `MEM_WRITE_WATCH` use in game modules, and no W+X sections
 - Thread naming: the MSVC `0x406D1388` exception (2 sites in the exe); EOSSDK uses `SetThreadDescription`
 - Graphics through delay-loaded `d3d11`/`dxgi`; audio `xaudio2_9redist`; input `xinput1_3`, `dinput8`
+
+## Runtime pieces
+- `runtime/jit`: JIT region + StikDebug startup protocol + allocator (D-010). Linux tests pass
+  (`make -C tests/jit test`). Darwin backend compile-checked in CI only (no SDK on Debian).
+  FEX does not yet use it (R-007).

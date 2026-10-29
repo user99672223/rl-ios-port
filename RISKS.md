@@ -37,3 +37,18 @@ TEB fiber data, which interacts with the x18/TEB handling (D-009). Needs a test 
 non-default MXCSR rounding (RC=1/2/3) are wrong in ~45% of cases; with RC=0 only 3/45 cases
 differ beyond MXCSR. Real ARM64 results from `linux-arm64.yml` decide whether this is the
 simulator or FEX. Games rarely read MXCSR flags or change RC; FTZ/DAZ matter more.
+
+## R-007 — FEX writes and executes JIT code at the same address (no W^X split)
+**Status:** open. **Severity:** blocks JIT on iOS until fixed.
+FEX's code buffers come from `FEXCore::Allocator::VirtualAlloc(Size, Execute=true)`, which is
+`PAGE_EXECUTE_READWRITE` on Windows/ARM64EC (`FEXCore/include/FEXCore/Utils/AllocatorHooks.h:49-61`),
+and `CodeBuffer` (`FEXCore/Source/Interface/Core/SharedCodeBufferManager.h`) is a single linear
+buffer that the emitter writes into and executes from. iOS never allows W+X, and on TXM devices
+the executable region comes from the debugger (D-010) with a separate RW alias. FEX has no
+split-mapping support (no MAP_JIT, no write/exec offset anywhere in FEXCore).
+**Needed:** a local FEX patch series (D-008) that allocates code buffers from `runtime/jit`
+and writes through `rx + jit_rw_minus_rx()` everywhere code is emitted or patched: block
+emission, block linking/backpatching, dispatcher and thunk generation, and copying disk-cache
+hits (D-007). QEMU's TCG did the same (`tcg_splitwx_diff`). Branch targets and literals must
+be computed from the RX address.
+**Fallback:** none that preserves JIT. This is next in line after the macOS integration work.
