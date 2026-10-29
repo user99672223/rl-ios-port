@@ -28,7 +28,9 @@
 ## Runtime pieces
 - `runtime/jit`: JIT region + StikDebug startup protocol + allocator (D-010). Linux tests pass
   (`make -C tests/jit test`). Darwin backend compile-checked in CI only (no SDK on Debian).
-  FEX does not yet use it (R-007).
+  FEX side done: `patches/fex/0200-0206` split W^X code memory (ARM64 CI: identical results
+  with/without split mode). Still to do: an adapter from `runtime/jit` to FEX's hook, installed in
+  the ARM64EC module before the first Context.
 - 4 KB pages: Wine already ORs 4 KB protections per host page; `runtime/prot4k` + `patches/wine/0100-0105`
   add W^X, soft guard/write-watch, exact VirtualQuery, decommit zero-fill (tests + simulated-16K Wine run pass).
   Native executable memory must come from `runtime/jit` (Wine's executable VirtualAlloc gets no host X).
