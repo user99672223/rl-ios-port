@@ -36,8 +36,8 @@ LADDER_LINES=400 rung L4-smoke-all 900 wine "$SMOKE_DIR/smoke.exe"
 # Aggregate PASS/FAIL lines from the per-section runs.
 {
   echo "---- smoke check totals (per-section runs) ----"
-  cat "$LOG_DIR"/ladder-L4-smoke-*.log 2>/dev/null | tr -d '\r' | grep -E '^(PASS|FAIL) ' | grep -v '^$' | \
-    awk '{c[$1]++} END{printf "PASS=%d FAIL=%d\n", c["PASS"], c["FAIL"]}'
+  cat "$LOG_DIR"/ladder-L4-smoke-*.log 2>/dev/null | tr -d '\r' | { grep -E '^(PASS|FAIL) ' || true; } | \
+    awk '{c[$1]++} END{printf "PASS=%d FAIL=%d\n", c["PASS"], c["FAIL"]}' || true
   cat "$LOG_DIR"/ladder-L4-smoke-*.log 2>/dev/null | tr -d '\r' | grep -E '^FAIL ' || true
 } | tee "$LOG_DIR/smoke-summary.txt"
 

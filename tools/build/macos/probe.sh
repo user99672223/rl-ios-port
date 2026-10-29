@@ -71,3 +71,20 @@ printf '<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleIdentifier<
 clang -o "$dir/tiny-sa-plist" "$dir/tiny.c" -mmacosx-version-min=12 -Wl,-segalign,0x4000,-sectcreate,__TEXT,__info_plist,"$dir/x.plist" 2>&1 | head -2
 rc=0; "$dir/tiny-sa-plist" > /dev/null 2>&1 || rc=$?
 echo "PROBE segalign=0x4000 + __info_plist section: exit status $rc"
+
+echo "PROBE ---- plain RWX mmap (no MAP_JIT) under hardened runtime / entitlements: can a signed Wine loader get W+X without patching FEX?"
+for ent in com.apple.security.cs.allow-unsigned-executable-memory com.apple.security.cs.allow-jit \
+           com.apple.security.cs.disable-executable-page-protection com.apple.security.get-task-allow; do
+  for hardened in 1 0; do
+    cat > "$dir/ent.plist" <<EOF2
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>$ent</key><true/></dict></plist>
+EOF2
+    cp "$dir/probe" "$dir/probe-ent"
+    opts=""; [ "$hardened" = 1 ] && opts="-o runtime"
+    codesign -s - --force $opts --entitlements "$dir/ent.plist" "$dir/probe-ent" 2>&1 | head -2
+    echo "PROBE entitlement $ent hardened=$hardened:"
+    "$dir/probe-ent" rwx 2>&1 | sed -e 's/^/PROBE    /' || true
+  done
+done
