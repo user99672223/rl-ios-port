@@ -58,7 +58,10 @@ plutil -convert binary1 "$APP/Info.plist"
 cp "$ROOT/ios/App/RLPort.entitlements" "$OUT/"
 
 if [ "$KIND" = simulator ]; then
-  codesign --force --sign - --entitlements "$ROOT/ios/App/RLPort.entitlements" "$APP"
+  # Ad-hoc, no embedded entitlements: an ad-hoc signature carrying entitlements is killed at
+  # launch in the Simulator ("Taskgated Invalid Signature", seen in ios.yml run 40824425328).
+  codesign --force --sign - "$APP"
+  codesign --verify --strict --verbose=2 "$APP"
   echo "built $APP"
 else
   rm -rf "$OUT/Payload" "$OUT/RLPortRuntime.ipa"
