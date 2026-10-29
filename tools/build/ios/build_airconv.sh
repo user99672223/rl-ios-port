@@ -70,8 +70,13 @@ build_airconv() {
   for s in "${srcs[@]}"; do
     "${cxx[@]}" -c "$DXMT/src/airconv/$s.cpp" -o "$obj/$(echo "$s" | tr / _).o"
   done
+  # DXBCParser keeps exceptions on: DXMT builds it with only dxbc_parser_args
+  # (libs/DXBCParser/meson.build), unlike airconv's LLVM-style -fno-exceptions -fno-rtti.
+  local cxx_dxbc=(xcrun --sdk iphoneos clang++ -target "arm64-apple-ios$IOS_MIN" -isysroot "$SDK"
+    -std=c++20 -O2 -Wno-extern-c-compat -Wno-unknown-pragmas
+    -I"$DXMT/include" -I"$DXMT/libs" -I"$DXMT/include/native/windows" -I"$DXMT/include/native/directx")
   for s in DXBCUtils BlobContainer ShaderBinary; do
-    "${cxx[@]}" -c "$DXMT/libs/DXBCParser/$s.cpp" -o "$obj/dxbc_$s.o"
+    "${cxx_dxbc[@]}" -c "$DXMT/libs/DXBCParser/$s.cpp" -o "$obj/dxbc_$s.o"
   done
   xcrun --sdk iphoneos libtool -static -o "$OUT/airconv/libairconv.a" "$obj"/*.o
   echo "built $OUT/airconv/libairconv.a"
