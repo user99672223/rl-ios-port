@@ -1,0 +1,28 @@
+# Pure-Python wheels embedded in the iOS app next to Legendary (installed by vendor_deps.sh).
+#
+# Source of the list: external/legendary/pyproject.toml [project].dependencies = requests,
+# filelock, pycryptodomex; requests' own dependencies come from the resolved graph in
+# external/legendary/uv.lock (requests -> certifi, charset-normalizer, idna, urllib3).
+# Versions and sha256 are exactly the py3-none-any wheel entries of that uv.lock (tag 0.21.1),
+# so they are the set Legendary's maintainers resolved and locked.
+#
+# NOT included, on purpose: pycryptodomex.  It is not pure Python (C extensions loaded with
+# cffi/ctypes) and has no iOS wheel on PyPI.  uv.lock pins 3.23.0 (sdist sha256
+# 71909758f010c82bc99b0abf4ea12012c98962fbf0583c2164f8b84533c2e4da).  ios/legendary/bridge.py
+# runs without it; see docs/notes/auth.md (R-proposal) for the iOS build options.
+#
+# To bump certifi (Mozilla CA bundle): take a newer py3-none-any wheel and its sha256 from
+# https://pypi.org/pypi/certifi/<version>/json and replace the pin below.
+
+certifi==2026.2.25 \
+    --hash=sha256:027692e4402ad994f1c42e52a4997a9763c646b73e4096e4d5d6db8af1d6f0fa
+charset-normalizer==3.4.7 \
+    --hash=sha256:3dce51d0f5e7951f8bb4900c257dad282f49190fdbebecd4ba99bcc41fef404d
+filelock==3.25.2 \
+    --hash=sha256:ca8afb0da15f229774c9ad1b455ed96e85a81373065fb10446672f64444ddf70
+idna==3.15 \
+    --hash=sha256:048adeaf8c2d788c40fee287673ccaa74c24ffd8dcf09ffa555a2fbb59f10ac8
+requests==2.33.1 \
+    --hash=sha256:4e6d1ef462f3626a1f0a0a9c42dd93c63bad33f9f1c1937509b8c5c8718ab56a
+urllib3==2.7.0 \
+    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
