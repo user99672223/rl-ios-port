@@ -1,0 +1,262 @@
+diff --git a/src/d3d11/d3d11_context_def.cpp b/src/d3d11/d3d11_context_def.cpp
+index 821a842..7141156 100644
+--- a/src/d3d11/d3d11_context_def.cpp
++++ b/src/d3d11/d3d11_context_def.cpp
+@@ -272,8 +272,12 @@ public:
+     UINT bind_flag = 0, &depth_pitch = bind_flag;
+     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
+       BlitObject texture(device, pResource);
+-      UpdateTexture(TextureUpdateCommand(texture, Subresource, nullptr),
+-                    dynamic->buffer, row_pitch, depth_pitch);
++      TextureUpdateCommand cmd(texture, Subresource, nullptr);
++      if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_BC) {
++        ERR_ONCE("BC emulation: Map / Unmap of a dynamic BC texture on a deferred context is not supported");
++        return;
++      }
++      UpdateTexture(std::move(cmd), dynamic->buffer, row_pitch, depth_pitch);
+     }
+   }
+ 
+diff --git a/src/d3d11/d3d11_context_imm.cpp b/src/d3d11/d3d11_context_imm.cpp
+index b361f17..9919f04 100644
+--- a/src/d3d11/d3d11_context_imm.cpp
++++ b/src/d3d11/d3d11_context_imm.cpp
+@@ -298,8 +298,14 @@ public:
+     };
+     if (auto dynamic = GetDynamicTexture(pResource, Subresource, &row_pitch, &depth_pitch)) {
+       BlitObject texture(device, pResource);
+-      UpdateTexture(TextureUpdateCommand(texture, Subresource, nullptr),
+-                    dynamic->buffer, row_pitch, depth_pitch);
++      TextureUpdateCommand cmd(texture, Subresource, nullptr);
++      if (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_BC) {
++        // BC emulation: the application wrote BC blocks into the CPU buffer it got from Map;
++        // the Metal texture holds decoded pixels, so decode instead of a buffer->texture blit.
++        UpdateTexture(std::move(cmd), dynamic->immediateMappedMemory(), row_pitch, depth_pitch, 0);
++        return;
++      }
++      UpdateTexture(std::move(cmd), dynamic->buffer, row_pitch, depth_pitch);
+     }
+   }
+ 
+diff --git a/src/d3d11/d3d11_context_impl.cpp b/src/d3d11/d3d11_context_impl.cpp
+index d53be63..938959f 100644
+--- a/src/d3d11/d3d11_context_impl.cpp
++++ b/src/d3d11/d3d11_context_impl.cpp
+@@ -17,6 +17,7 @@ since it is for internal use only
+ #include "d3d11_device.hpp"
+ #include "d3d11_pipeline.hpp"
+ #include "d3d11_query.hpp"
++#include "dxmt_bc_emulation.hpp"
+ #include "dxmt_buffer.hpp"
+ #include "dxmt_context.hpp"
+ #include "dxmt_format.hpp"
+@@ -3849,6 +3850,8 @@ public:
+   CopyTexture(TextureCopyCommand &&cmd) {
+     if (cmd.Invalid)
+       return;
++    if ((cmd.SrcFormat.Flag | cmd.DstFormat.Flag) & MTL_DXGI_FORMAT_EMULATED_BC)
++      return CopyTextureBCEmulated(std::move(cmd));
+     if ((cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) != (cmd.DstFormat.Flag & MTL_DXGI_FORMAT_BC)) {
+       if (cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_BC) {
+         return CopyTextureFromCompressed(std::move(cmd));
+@@ -4145,6 +4148,190 @@ public:
+     }
+   }
+ 
++#pragma region BC emulation (dxmt_bc_emulation.hpp)
++
++  /**
++  Upload decoded pixels (the substitute format of an emulated BC texture) to a region of a
++  subresource: CPU staging allocation + buffer-to-texture blit, like UpdateTexture.
++  */
++  void
++  UploadEmulatedBCPixels(
++      Rc<Texture> &&dst, uint32_t mip, uint32_t slice, WMTOrigin origin, WMTSize size, const std::vector<uint8_t> &pixels,
++      size_t bytes_per_row, size_t bytes_per_image
++  ) {
++    auto [staging_buffer, offset] = AllocateStagingBuffer(pixels.size(), 16);
++    staging_buffer.updateContents(offset, pixels.data(), pixels.size());
++    SwitchToBlitEncoder(CommandBufferState::UpdateBlitEncoderActive);
++    EmitOP([staging_buffer, offset, dst = std::move(dst), mip, slice, origin, size, bytes_per_row,
++            bytes_per_image](ArgumentEncodingContext &enc) {
++      auto texture = enc.access(dst, mip, slice, ResourceAccess::Write);
++      auto &cmd_cptex = enc.encodeBlitCommand<wmtcmd_blit_copy_from_buffer_to_texture>();
++      cmd_cptex.type = WMTBlitCommandCopyFromBufferToTexture;
++      cmd_cptex.src = staging_buffer;
++      cmd_cptex.src_offset = offset;
++      cmd_cptex.bytes_per_row = bytes_per_row;
++      cmd_cptex.bytes_per_image = bytes_per_image;
++      cmd_cptex.size = size;
++      cmd_cptex.dst = texture;
++      cmd_cptex.slice = slice;
++      cmd_cptex.level = mip;
++      cmd_cptex.origin = origin;
++    });
++  }
++
++  /**
++  UpdateSubresource / Unmap of a dynamic texture on an emulated BC texture: the source is BC
++  blocks with the application's pitches (bytes per block row / per depth slice). Decode on the
++  CPU (rltex), upload the pixels, keep the blocks in the shadow copy if there is one.
++  */
++  void
++  UpdateTextureBCEmulated(TextureUpdateCommand &&cmd, const void *pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) {
++    auto dst = GetTexture(cmd.pDst);
++    auto info = bc::GetFormatInfo(cmd.Dst.Format);
++    auto state = dst->bcState();
++    if (!info || !pSrcData)
++      return;
++    if (state && state->isAstc()) {
++      ERR_ONCE("BC emulation: UpdateSubresource on a texture backed by cached ASTC is not supported");
++      return;
++    }
++    const uint32_t w = cmd.DstSize.width, h = cmd.DstSize.height, d = cmd.DstSize.depth;
++    if ((cmd.DstOrigin.x | cmd.DstOrigin.y) & 3) {
++      WARN("BC emulation: update box (", cmd.DstOrigin.x, ", ", cmd.DstOrigin.y, ") is not block aligned");
++      return;
++    }
++    uint32_t cols = bc::BlocksOf(w), rows = bc::BlocksOf(h);
++    size_t row_bytes = size_t(cols) * info->block_bytes;
++    size_t src_row = std::max<size_t>(SrcRowPitch, row_bytes);
++    size_t src_slice = SrcDepthPitch ? SrcDepthPitch : src_row * rows;
++    std::vector<uint8_t> blocks(row_bytes * rows * d), pixels;
++    bc::CopyBlocks(
++        blocks.data(), row_bytes, row_bytes * rows, static_cast<const uint8_t *>(pSrcData), src_row, src_slice,
++        info->block_bytes, cols, rows, d
++    );
++    if (!bc::Decode(*info, w, h, d, blocks.data(), pixels))
++      return;
++    if (state)
++      state->shadowStoreRegion(
++          cmd.DstSubresource, cmd.Dst.MipLevel,
++          bc::Region{uint32_t(cmd.DstOrigin.x), uint32_t(cmd.DstOrigin.y), uint32_t(cmd.DstOrigin.z), w, h, d},
++          blocks.data()
++      );
++    size_t bpr = size_t(w) * info->decoded_bytes;
++    UploadEmulatedBCPixels(
++        std::move(dst), cmd.Dst.MipLevel, cmd.Dst.ArraySlice, cmd.DstOrigin, cmd.DstSize, pixels, bpr, bpr * h
++    );
++  }
++
++  /**
++  CopyResource / CopySubresourceRegion where an end is an emulated BC texture. Both ends must
++  be BC of one block size (D3D11 allows nothing else but bitcasts to R32G32B32A32_UINT etc.,
++  which are not supported on emulated textures). Per combination:
++    staging  -> staging   CPU copy of the blocks
++    staging  -> texture   gather blocks, decode, upload (+ shadow)
++    texture  -> staging   blocks from the shadow copy (needs DXMT_BC_SHADOW=1 or ASTC backing)
++    texture  -> texture   same Metal format: GPU copy (+ shadow); otherwise (ASTC source, decoded
++                          destination) decode the source's shadow and upload
++  All CPU work happens at call time, like UpdateSubresource: staging memory is stable then.
++  */
++  void
++  CopyTextureBCEmulated(TextureCopyCommand &&cmd) {
++    const bool src_bc = cmd.SrcFormat.Flag & MTL_DXGI_FORMAT_EMULATED_BC;
++    const bool dst_bc = cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_BC;
++    if (!src_bc || !dst_bc || cmd.SrcFormat.BlockSize != cmd.DstFormat.BlockSize) {
++      ERR_ONCE("BC emulation: copy between an emulated BC texture and a different format is not supported");
++      return;
++    }
++    auto info = bc::GetFormatInfo(cmd.Src.Format);
++    if (!info)
++      return;
++    auto staging_src = GetStagingResource(cmd.pSrc, cmd.SrcSubresource);
++    auto staging_dst = GetStagingResource(cmd.pDst, cmd.DstSubresource);
++    Rc<Texture> src_tex = staging_src ? Rc<Texture>() : GetTexture(cmd.pSrc);
++    Rc<Texture> dst_tex = staging_dst ? Rc<Texture>() : GetTexture(cmd.pDst);
++    bc::TextureState *src_state = src_tex ? src_tex->bcState() : nullptr;
++    bc::TextureState *dst_state = dst_tex ? dst_tex->bcState() : nullptr;
++    if (dst_state && dst_state->isAstc()) {
++      ERR_ONCE("BC emulation: copy into a texture backed by cached ASTC is not supported");
++      return;
++    }
++
++    const WMTOrigin so = cmd.SrcOrigin, dor = cmd.DstOrigin;
++    const WMTSize sz = cmd.SrcSize;
++    const uint32_t cols = bc::BlocksOf(sz.width), rows = bc::BlocksOf(sz.height), depth = sz.depth;
++    const size_t row_bytes = size_t(cols) * info->block_bytes;
++    const bc::Region src_region{uint32_t(so.x),       uint32_t(so.y),         uint32_t(so.z),
++                                uint32_t(sz.width),   uint32_t(sz.height),    uint32_t(sz.depth)};
++    const bc::Region dst_region{uint32_t(dor.x),      uint32_t(dor.y),        uint32_t(dor.z),
++                                uint32_t(sz.width),   uint32_t(sz.height),    uint32_t(sz.depth)};
++
++    // The source blocks, tightly packed, if they can be had.
++    std::vector<uint8_t> blocks;
++    bool have_blocks = false;
++    auto load_blocks = [&]() {
++      blocks.resize(row_bytes * rows * depth);
++      if (staging_src) {
++        auto base = static_cast<const uint8_t *>(staging_src->mappedImmediateMemory());
++        bc::CopyBlocks(
++            blocks.data(), row_bytes, row_bytes * rows,
++            base + size_t(so.z) * staging_src->bytesPerImage + size_t(so.y >> 2) * staging_src->bytesPerRow +
++                size_t(so.x >> 2) * info->block_bytes,
++            staging_src->bytesPerRow, staging_src->bytesPerImage, info->block_bytes, cols, rows, depth
++        );
++        have_blocks = true;
++      } else if (src_state) {
++        have_blocks = src_state->shadowLoadRegion(cmd.SrcSubresource, cmd.Src.MipLevel, src_region, blocks.data());
++      }
++      return have_blocks;
++    };
++
++    if (staging_dst) {
++      if (!load_blocks()) {
++        ERR_ONCE("BC emulation: reading BC data back from a texture needs its blocks; set DXMT_BC_SHADOW=1");
++        return;
++      }
++      auto base = static_cast<uint8_t *>(staging_dst->mappedImmediateMemory());
++      bc::CopyBlocks(
++          base + size_t(dor.z) * staging_dst->bytesPerImage + size_t(dor.y >> 2) * staging_dst->bytesPerRow +
++              size_t(dor.x >> 2) * info->block_bytes,
++          staging_dst->bytesPerRow, staging_dst->bytesPerImage, blocks.data(), row_bytes, row_bytes * rows,
++          info->block_bytes, cols, rows, depth
++      );
++      return;
++    }
++
++    if (!dst_tex)
++      return;
++
++    if (src_tex && Forget_sRGB(src_tex->pixelFormat()) == Forget_sRGB(dst_tex->pixelFormat())) {
++      // same Metal format on both sides: the GPU copies texels, whatever they were decoded from
++      if (dst_state && dst_state->shadowEnabled()) {
++        if (load_blocks())
++          dst_state->shadowStoreRegion(cmd.DstSubresource, cmd.Dst.MipLevel, dst_region, blocks.data());
++        else
++          dst_state->shadowInvalidate(cmd.DstSubresource);
++      }
++      return CopyTextureBitcast(std::move(cmd));
++    }
++
++    // Blocks -> pixels -> texture
++    if (!load_blocks()) {
++      ERR_ONCE("BC emulation: copy between textures backed by different Metal formats needs the source's blocks");
++      return;
++    }
++    std::vector<uint8_t> pixels;
++    if (!bc::Decode(*info, sz.width, sz.height, depth, blocks.data(), pixels))
++      return;
++    if (dst_state)
++      dst_state->shadowStoreRegion(cmd.DstSubresource, cmd.Dst.MipLevel, dst_region, blocks.data());
++    size_t bpr = size_t(sz.width) * info->decoded_bytes;
++    UploadEmulatedBCPixels(
++        std::move(dst_tex), cmd.Dst.MipLevel, cmd.Dst.ArraySlice, dor, sz, pixels, bpr, bpr * sz.height
++    );
++  }
++
++#pragma endregion
++
+   void
+   UpdateTexture(
+       TextureUpdateCommand &&cmd, const void *pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch, UINT CopyFlags
+@@ -4154,6 +4341,9 @@ public:
+ 
+     std::lock_guard<mutex_t> lock(mutex);
+ 
++    if ((cmd.DstFormat.Flag & MTL_DXGI_FORMAT_EMULATED_BC) && GetTexture(cmd.pDst))
++      return UpdateTextureBCEmulated(std::move(cmd), pSrcData, SrcRowPitch, SrcDepthPitch);
++
+     if (auto dst = GetTexture(cmd.pDst)) {
+       auto bytes_per_depth_slice = cmd.EffectiveRows * cmd.EffectiveBytesPerRow;
+       auto [staging_buffer, offset] = AllocateStagingBuffer(bytes_per_depth_slice * cmd.DstSize.depth, 16);

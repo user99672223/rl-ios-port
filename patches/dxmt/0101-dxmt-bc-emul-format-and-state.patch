@@ -1,0 +1,914 @@
+diff --git a/src/dxmt/dxmt_bc_emulation.cpp b/src/dxmt/dxmt_bc_emulation.cpp
+new file mode 100644
+index 0000000..dccbbd3
+--- /dev/null
++++ b/src/dxmt/dxmt_bc_emulation.cpp
+@@ -0,0 +1,441 @@
++#include "dxmt_bc_emulation.hpp"
++#include "dxmt_format.hpp"
++#include "log/log.hpp"
++#include "util_env.hpp"
++#include <algorithm>
++#include <cstring>
++#include <mutex>
++
++namespace dxmt {
++namespace bc {
++
++namespace {
++
++/* rltex_pixfmt (runtime/textures/include/rltex.h) */
++constexpr uint32_t RLTEX_PIX_R8_UNORM = 1, RLTEX_PIX_RG8_UNORM = 2, RLTEX_PIX_RGBA8_UNORM = 3,
++                   RLTEX_PIX_R8_SNORM = 4, RLTEX_PIX_RG8_SNORM = 5, RLTEX_PIX_RGBA16_FLOAT = 6;
++
++constexpr FormatInfo kFormats[] = {
++    /* format                      kind        srgb   signed block bc_format                         decoded                       bpt */
++    {DXGI_FORMAT_BC1_UNORM,       Kind::BC1,  false, false, 8,  WMTPixelFormatBC1_RGBA,            WMTPixelFormatRGBA8Unorm,      4},
++    {DXGI_FORMAT_BC1_UNORM_SRGB,  Kind::BC1,  true,  false, 8,  WMTPixelFormatBC1_RGBA_sRGB,       WMTPixelFormatRGBA8Unorm_sRGB, 4},
++    {DXGI_FORMAT_BC2_UNORM,       Kind::BC2,  false, false, 16, WMTPixelFormatBC2_RGBA,            WMTPixelFormatRGBA8Unorm,      4},
++    {DXGI_FORMAT_BC2_UNORM_SRGB,  Kind::BC2,  true,  false, 16, WMTPixelFormatBC2_RGBA_sRGB,       WMTPixelFormatRGBA8Unorm_sRGB, 4},
++    {DXGI_FORMAT_BC3_UNORM,       Kind::BC3,  false, false, 16, WMTPixelFormatBC3_RGBA,            WMTPixelFormatRGBA8Unorm,      4},
++    {DXGI_FORMAT_BC3_UNORM_SRGB,  Kind::BC3,  true,  false, 16, WMTPixelFormatBC3_RGBA_sRGB,       WMTPixelFormatRGBA8Unorm_sRGB, 4},
++    {DXGI_FORMAT_BC4_UNORM,       Kind::BC4,  false, false, 8,  WMTPixelFormatBC4_RUnorm,          WMTPixelFormatR8Unorm,         1},
++    {DXGI_FORMAT_BC4_SNORM,       Kind::BC4,  false, true,  8,  WMTPixelFormatBC4_RSnorm,          WMTPixelFormatR8Snorm,         1},
++    {DXGI_FORMAT_BC5_UNORM,       Kind::BC5,  false, false, 16, WMTPixelFormatBC5_RGUnorm,         WMTPixelFormatRG8Unorm,        2},
++    {DXGI_FORMAT_BC5_SNORM,       Kind::BC5,  false, true,  16, WMTPixelFormatBC5_RGSnorm,         WMTPixelFormatRG8Snorm,        2},
++    {DXGI_FORMAT_BC6H_UF16,       Kind::BC6H, false, false, 16, WMTPixelFormatBC6H_RGBUfloat,      WMTPixelFormatRGBA16Float,     8},
++    {DXGI_FORMAT_BC6H_SF16,       Kind::BC6H, false, true,  16, WMTPixelFormatBC6H_RGBFloat,       WMTPixelFormatRGBA16Float,     8},
++    {DXGI_FORMAT_BC7_UNORM,       Kind::BC7,  false, false, 16, WMTPixelFormatBC7_RGBAUnorm,       WMTPixelFormatRGBA8Unorm,      4},
++    {DXGI_FORMAT_BC7_UNORM_SRGB,  Kind::BC7,  true,  false, 16, WMTPixelFormatBC7_RGBAUnorm_sRGB,  WMTPixelFormatRGBA8Unorm_sRGB, 4},
++};
++
++const FormatInfo *
++Find(DXGI_FORMAT f) {
++  for (auto &e : kFormats)
++    if (e.format == f)
++      return &e;
++  return nullptr;
++}
++
++bool
++EnvIs(const char *name, const char *value) {
++  return env::getEnvVar(name) == value;
++}
++
++uint32_t
++SwizzleFlag(const char *s) {
++  if (!std::strcmp(s, "r001"))
++    return WMTPixelFormatR001Swizzle;
++  if (!std::strcmp(s, "ra01"))
++    return WMTPixelFormatRA01Swizzle;
++  return 0;
++}
++
++} // namespace
++
++const FormatInfo *
++GetFormatInfo(DXGI_FORMAT format) {
++  switch (format) {
++  case DXGI_FORMAT_BC1_TYPELESS:
++    return Find(DXGI_FORMAT_BC1_UNORM);
++  case DXGI_FORMAT_BC2_TYPELESS:
++    return Find(DXGI_FORMAT_BC2_UNORM);
++  case DXGI_FORMAT_BC3_TYPELESS:
++    return Find(DXGI_FORMAT_BC3_UNORM);
++  case DXGI_FORMAT_BC4_TYPELESS:
++    return Find(DXGI_FORMAT_BC4_UNORM);
++  case DXGI_FORMAT_BC5_TYPELESS:
++    return Find(DXGI_FORMAT_BC5_UNORM);
++  case DXGI_FORMAT_BC6H_TYPELESS:
++    return Find(DXGI_FORMAT_BC6H_UF16);
++  case DXGI_FORMAT_BC7_TYPELESS:
++    return Find(DXGI_FORMAT_BC7_UNORM);
++  default:
++    return Find(format);
++  }
++}
++
++bool
++DeviceSupportsBC(WMT::Device device) {
++  /* DXMT_DEBUG_FORCE_NO_BC=1: run the emulation on hardware that has native BC (macOS CI). */
++  if (EnvIs("DXMT_DEBUG_FORCE_NO_BC", "1"))
++    return false;
++  return device.supportsBCTextureCompression();
++}
++
++bool
++EmulationActive(WMT::Device device) {
++  static const bool active = [&] {
++    if (DeviceSupportsBC(device))
++      return false;
++    if (!(WMTBCEmulQuery() & WMT_BCEMUL_AVAILABLE)) {
++      WARN("BC emulation: the device has no BC support and winemetal.so was built without rltex; BC formats are not "
++           "available");
++      return false;
++    }
++    Logger::info(str::format(
++        "BC emulation active (", EnvIs("DXMT_DEBUG_FORCE_NO_BC", "1") ? "DXMT_DEBUG_FORCE_NO_BC" : "no native BC",
++        ", ASTC cache ", CacheEnabled() ? "on" : "off", ")"
++    ));
++    return true;
++  }();
++  return active;
++}
++
++bool
++CacheEnabled() {
++  static const bool on = (WMTBCEmulQuery() & WMT_BCEMUL_CACHE_ON) != 0;
++  return on;
++}
++
++bool
++AstcDefaultUsageAllowed() {
++  return !EnvIs("DXMT_BC_ASTC_DEFAULT", "0");
++}
++
++bool
++ShadowRequested() {
++  return EnvIs("DXMT_BC_SHADOW", "1");
++}
++
++void
++CopyBlocks(
++    uint8_t *dst, size_t dst_row_pitch, size_t dst_slice_pitch, const uint8_t *src, size_t src_row_pitch,
++    size_t src_slice_pitch, uint32_t block_bytes, uint32_t cols, uint32_t rows, uint32_t depth
++) {
++  size_t row_bytes = size_t(cols) * block_bytes;
++  for (uint32_t z = 0; z < depth; z++)
++    for (uint32_t y = 0; y < rows; y++)
++      std::memcpy(dst + z * dst_slice_pitch + y * dst_row_pitch, src + z * src_slice_pitch + y * src_row_pitch, row_bytes);
++}
++
++static bool
++CallUnix(
++    const FormatInfo &info, DXGI_FORMAT dxgi, uint32_t w, uint32_t h, uint32_t mip, uint32_t slice, const uint8_t *blocks,
++    size_t blob_size, uint8_t *out, size_t out_capacity, uint32_t flags, WMTBCEmulInfo &r
++) {
++  std::memset(&r, 0, sizeof(r));
++  r.blob.set(blocks);
++  r.out.set(out);
++  r.blob_size = blob_size;
++  r.out_capacity = out_capacity;
++  r.dxgi_format = dxgi;
++  r.width = w;
++  r.height = h;
++  r.mip_level = mip;
++  r.array_slice = slice;
++  r.flags = flags;
++  WMTBCEmulAcquire(&r);
++  if (r.status != 0 || r.source == WMTBCEmulSourceNone) {
++    ERR("BC emulation: decode of a ", w, "x", h, " surface (DXGI format ", uint32_t(dxgi), ") failed, status ", r.status);
++    return false;
++  }
++  return true;
++}
++
++bool
++Decode(const FormatInfo &info, uint32_t w, uint32_t h, uint32_t d, const uint8_t *blocks, std::vector<uint8_t> &out) {
++  size_t blob = size_t(BlocksOf(w)) * BlocksOf(h) * info.block_bytes;
++  size_t pix = size_t(w) * h * info.decoded_bytes;
++  out.resize(pix * d);
++  for (uint32_t z = 0; z < d; z++) {
++    WMTBCEmulInfo r;
++    if (!CallUnix(info, info.format, w, h, 0, 0, blocks + z * blob, blob, out.data() + z * pix, pix, 0, r))
++      return false;
++    if (r.out_size != pix) {
++      ERR("BC emulation: unexpected decoded size ", r.out_size, " (expected ", pix, ")");
++      return false;
++    }
++  }
++  return true;
++}
++
++bool
++Acquire(
++    const FormatInfo &info, DXGI_FORMAT dxgi, uint32_t w, uint32_t h, uint32_t mip, uint32_t slice, const uint8_t *blocks,
++    Surface &out
++) {
++  size_t blob = size_t(BlocksOf(w)) * BlocksOf(h) * info.block_bytes;
++  size_t pix = size_t(w) * h * info.decoded_bytes;
++  /* ASTC payload is at most one 16-byte block per 4x4 texels (the smallest legal block size). */
++  size_t cap = std::max(pix, size_t(BlocksOf(w)) * BlocksOf(h) * 16);
++  out.data.resize(cap);
++  WMTBCEmulInfo r;
++  if (!CallUnix(info, dxgi, w, h, mip, slice, blocks, blob, out.data.data(), cap, WMT_BCEMUL_USE_CACHE, r))
++    return false;
++  out.data.resize(r.out_size);
++  out.astc = r.source == WMTBCEmulSourceAstc;
++  out.block_x = r.astc_block_x;
++  out.block_y = r.astc_block_y;
++  out.profile = r.astc_profile;
++  std::memcpy(out.swizzle, r.view_swizzle, sizeof(out.swizzle));
++  out.swizzle[7] = 0;
++  return true;
++}
++
++WMTPixelFormat
++AstcPixelFormat(uint32_t bx, uint32_t by, uint32_t profile) {
++  struct Entry {
++    uint32_t bx, by;
++    WMTPixelFormat srgb, ldr, hdr;
++  };
++  static const Entry table[] = {
++      {4, 4, WMTPixelFormatASTC_4x4_sRGB, WMTPixelFormatASTC_4x4_LDR, WMTPixelFormatASTC_4x4_HDR},
++      {5, 4, WMTPixelFormatASTC_5x4_sRGB, WMTPixelFormatASTC_5x4_LDR, WMTPixelFormatASTC_5x4_HDR},
++      {5, 5, WMTPixelFormatASTC_5x5_sRGB, WMTPixelFormatASTC_5x5_LDR, WMTPixelFormatASTC_5x5_HDR},
++      {6, 5, WMTPixelFormatASTC_6x5_sRGB, WMTPixelFormatASTC_6x5_LDR, WMTPixelFormatASTC_6x5_HDR},
++      {6, 6, WMTPixelFormatASTC_6x6_sRGB, WMTPixelFormatASTC_6x6_LDR, WMTPixelFormatASTC_6x6_HDR},
++      {8, 5, WMTPixelFormatASTC_8x5_sRGB, WMTPixelFormatASTC_8x5_LDR, WMTPixelFormatASTC_8x5_HDR},
++      {8, 6, WMTPixelFormatASTC_8x6_sRGB, WMTPixelFormatASTC_8x6_LDR, WMTPixelFormatASTC_8x6_HDR},
++      {8, 8, WMTPixelFormatASTC_8x8_sRGB, WMTPixelFormatASTC_8x8_LDR, WMTPixelFormatASTC_8x8_HDR},
++      {10, 5, WMTPixelFormatASTC_10x5_sRGB, WMTPixelFormatASTC_10x5_LDR, WMTPixelFormatASTC_10x5_HDR},
++      {10, 6, WMTPixelFormatASTC_10x6_sRGB, WMTPixelFormatASTC_10x6_LDR, WMTPixelFormatASTC_10x6_HDR},
++      {10, 8, WMTPixelFormatASTC_10x8_sRGB, WMTPixelFormatASTC_10x8_LDR, WMTPixelFormatASTC_10x8_HDR},
++      {10, 10, WMTPixelFormatASTC_10x10_sRGB, WMTPixelFormatASTC_10x10_LDR, WMTPixelFormatASTC_10x10_HDR},
++      {12, 10, WMTPixelFormatASTC_12x10_sRGB, WMTPixelFormatASTC_12x10_LDR, WMTPixelFormatASTC_12x10_HDR},
++      {12, 12, WMTPixelFormatASTC_12x12_sRGB, WMTPixelFormatASTC_12x12_LDR, WMTPixelFormatASTC_12x12_HDR},
++  };
++  for (auto &e : table) {
++    if (e.bx == bx && e.by == by)
++      return profile == 1 ? e.srgb : (profile == 2 ? e.hdr : e.ldr);
++  }
++  return WMTPixelFormatInvalid;
++}
++
++/* ---- TextureState ----------------------------------------------------------------------- */
++
++TextureState::TextureState(
++    const FormatInfo &info, uint32_t width, uint32_t height, uint32_t depth, uint32_t mip_levels, uint32_t array_slices,
++    bool keep_shadow
++) :
++    info_(info),
++    width_(width),
++    height_(height),
++    depth_(depth),
++    mips_(mip_levels),
++    slices_(array_slices),
++    keep_shadow_(keep_shadow),
++    shadow_(size_t(mip_levels) * array_slices),
++    shadow_state_(size_t(mip_levels) * array_slices, Zero) {}
++
++void
++TextureState::setAstc(WMTPixelFormat ldr, WMTPixelFormat srgb, const char *swizzle) {
++  astc_ = true;
++  astc_ldr_ = ldr;
++  astc_srgb_ = srgb;
++  swizzle_flag_ = SwizzleFlag(swizzle);
++  keep_shadow_ = true; /* the only way to get the blocks back, or to copy into a decoded texture */
++}
++
++WMTPixelFormat
++TextureState::mapViewFormat(WMTPixelFormat requested) const {
++  if (!astc_)
++    return requested;
++  bool srgb = Is_sRGBVariant(WMTPixelFormat(ORIGINAL_FORMAT(requested)));
++  WMTPixelFormat base = (srgb && astc_srgb_ != WMTPixelFormatInvalid) ? astc_srgb_ : astc_ldr_;
++  return WMTPixelFormat(uint32_t(base) | swizzle_flag_);
++}
++
++void
++TextureState::mipSize(uint32_t mip, uint32_t &w, uint32_t &h, uint32_t &d) const {
++  w = std::max(1u, width_ >> mip);
++  h = std::max(1u, height_ >> mip);
++  d = std::max(1u, depth_ >> mip);
++}
++
++void
++TextureState::shadowStoreSubresource(uint32_t sub, std::vector<uint8_t> &&blocks) {
++  if (!keep_shadow_ || sub >= shadow_.size())
++    return;
++  std::lock_guard<dxmt::mutex> lock(mutex_);
++  shadow_[sub] = std::move(blocks);
++  shadow_state_[sub] = Valid;
++}
++
++void
++TextureState::shadowStoreRegion(uint32_t sub, uint32_t mip, const Region &r, const uint8_t *blocks) {
++  if (!keep_shadow_ || sub >= shadow_.size())
++    return;
++  std::lock_guard<dxmt::mutex> lock(mutex_);
++  if (shadow_state_[sub] == Unknown)
++    return;
++  uint32_t mw, mh, md;
++  mipSize(mip, mw, mh, md);
++  size_t row = size_t(BlocksOf(mw)) * info_.block_bytes;
++  size_t slice = row * BlocksOf(mh);
++  if (shadow_[sub].empty())
++    shadow_[sub].assign(slice * md, 0);
++  shadow_state_[sub] = Valid;
++  size_t src_row = size_t(BlocksOf(r.w)) * info_.block_bytes;
++  CopyBlocks(
++      shadow_[sub].data() + r.z * slice + size_t(r.y >> 2) * row + size_t(r.x >> 2) * info_.block_bytes, row, slice,
++      blocks, src_row, src_row * BlocksOf(r.h), info_.block_bytes, BlocksOf(r.w), BlocksOf(r.h), r.d
++  );
++}
++
++bool
++TextureState::shadowLoadRegion(uint32_t sub, uint32_t mip, const Region &r, uint8_t *out) {
++  if (sub >= shadow_.size())
++    return false;
++  std::lock_guard<dxmt::mutex> lock(mutex_);
++  size_t dst_row = size_t(BlocksOf(r.w)) * info_.block_bytes;
++  size_t dst_slice = dst_row * BlocksOf(r.h);
++  if (shadow_state_[sub] == Unknown)
++    return false;
++  if (shadow_state_[sub] == Zero) {
++    /* never written: D3D11 textures start out zeroed */
++    std::memset(out, 0, dst_slice * r.d);
++    return keep_shadow_;
++  }
++  uint32_t mw, mh, md;
++  mipSize(mip, mw, mh, md);
++  size_t row = size_t(BlocksOf(mw)) * info_.block_bytes;
++  size_t slice = row * BlocksOf(mh);
++  CopyBlocks(
++      out, dst_row, dst_slice,
++      shadow_[sub].data() + r.z * slice + size_t(r.y >> 2) * row + size_t(r.x >> 2) * info_.block_bytes, row, slice,
++      info_.block_bytes, BlocksOf(r.w), BlocksOf(r.h), r.d
++  );
++  return true;
++}
++
++void
++TextureState::shadowInvalidate(uint32_t sub) {
++  if (!keep_shadow_ || sub >= shadow_.size())
++    return;
++  std::lock_guard<dxmt::mutex> lock(mutex_);
++  shadow_[sub].clear();
++  shadow_[sub].shrink_to_fit();
++  shadow_state_[sub] = Unknown;
++}
++
++/* ---- initial data ----------------------------------------------------------------------- */
++
++bool
++PrepareInitialData(
++    const FormatInfo &info, TextureState &state, uint32_t width, uint32_t height, uint32_t depth, uint32_t mips,
++    uint32_t slices, const InitialSubresource *initial, bool allow_astc, std::vector<PreparedSubresource> &out,
++    WMTPixelFormat *astc_base
++) {
++  const bool use_cache = allow_astc && CacheEnabled();
++  out.clear();
++  out.resize(size_t(mips) * slices);
++  bool all_astc = use_cache;
++  PreparedSubresource *first = nullptr;
++
++  for (uint32_t slice = 0; slice < slices; slice++) {
++    for (uint32_t mip = 0; mip < mips; mip++) {
++      uint32_t sub = mip + slice * mips;
++      auto &p = out[sub];
++      state.mipSize(mip, p.width, p.height, p.depth);
++      uint32_t cols = BlocksOf(p.width), rows = BlocksOf(p.height);
++      size_t row_bytes = size_t(cols) * info.block_bytes;
++      size_t slice_bytes = row_bytes * rows;
++      const InitialSubresource &src = initial[sub];
++      if (!src.data) {
++        ERR("BC emulation: initial data of subresource ", sub, " is null");
++        return false;
++      }
++      size_t src_row = src.row_pitch ? src.row_pitch : row_bytes;
++      if (src_row < row_bytes) {
++        WARN("BC emulation: row pitch ", src_row, " < ", row_bytes, " bytes needed (subresource ", sub, ")");
++        src_row = row_bytes;
++      }
++      size_t src_slice = src.slice_pitch ? src.slice_pitch : src_row * rows;
++      p.blocks.resize(slice_bytes * p.depth);
++      CopyBlocks(
++          p.blocks.data(), row_bytes, slice_bytes, static_cast<const uint8_t *>(src.data), src_row, src_slice,
++          info.block_bytes, cols, rows, p.depth
++      );
++
++      bool got = false;
++      /* Every surface goes through the cache even after one missed: a miss is what saves the
++         .bc blob and writes the miss log that the offline encoder works from. */
++      if (use_cache && p.depth == 1) {
++        Surface s;
++        if (!Acquire(info, info.format, p.width, p.height, mip, slice, p.blocks.data(), s))
++          return false;
++        if (s.astc) {
++          p.astc = true;
++          p.data = std::move(s.data);
++          p.block_x = s.block_x;
++          p.block_y = s.block_y;
++          p.profile = s.profile;
++          std::memcpy(p.swizzle, s.swizzle, sizeof(p.swizzle));
++          p.bytes_per_row = ((p.width + p.block_x - 1) / p.block_x) * 16;
++          p.bytes_per_image = 0;
++          got = true;
++          if (!first)
++            first = &p;
++          else if (p.block_x != first->block_x || p.block_y != first->block_y || p.profile != first->profile ||
++                   std::strcmp(p.swizzle, first->swizzle))
++            all_astc = false;
++        } else {
++          /* decoded already (miss: .bc saved, miss logged); this texture cannot be ASTC */
++          all_astc = false;
++          p.data = std::move(s.data);
++          got = true;
++        }
++      } else {
++        all_astc = false; /* 3D surfaces and uncached mode: decode only */
++      }
++      if (!got && !Decode(info, p.width, p.height, p.depth, p.blocks.data(), p.data))
++        return false;
++      if (!p.astc) {
++        p.bytes_per_row = p.width * info.decoded_bytes;
++        p.bytes_per_image = p.bytes_per_row * p.height;
++      }
++    }
++  }
++
++  if (all_astc && first) {
++    WMTPixelFormat ldr = AstcPixelFormat(first->block_x, first->block_y, first->profile == 2 ? 2 : 0);
++    WMTPixelFormat srgb = first->profile == 2 ? WMTPixelFormatInvalid : AstcPixelFormat(first->block_x, first->block_y, 1);
++    if (ldr != WMTPixelFormatInvalid) {
++      state.setAstc(ldr, srgb, first->swizzle);
++      *astc_base = first->profile == 1 ? srgb : ldr;
++      return true;
++    }
++    all_astc = false;
++  }
++
++  /* Not (fully) cached: any subresource that hit but is not usable as ASTC needs pixels. */
++  for (auto &p : out) {
++    if (p.astc) {
++      p.astc = false;
++      if (!Decode(info, p.width, p.height, p.depth, p.blocks.data(), p.data))
++        return false;
++      p.bytes_per_row = p.width * info.decoded_bytes;
++      p.bytes_per_image = p.bytes_per_row * p.height;
++    }
++  }
++  *astc_base = WMTPixelFormatInvalid;
++  return true;
++}
++
++} // namespace bc
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_bc_emulation.hpp b/src/dxmt/dxmt_bc_emulation.hpp
+new file mode 100644
+index 0000000..2bb4741
+--- /dev/null
++++ b/src/dxmt/dxmt_bc_emulation.hpp
+@@ -0,0 +1,205 @@
++#pragma once
++/*
++ * BC1-BC7 texture emulation for Metal devices without BC support (patches/dxmt/0100).
++ *
++ * The D3D11 side keeps BC semantics (block layouts for initial data, UpdateSubresource,
++ * Map/Unmap, staging copies). The Metal texture behind a BC texture is a substitute format the
++ * device can sample: RGBA8 (sRGB where applicable) for BC1/2/3/7, R8 / RG8 (UNORM or SNORM)
++ * for BC4 / BC5, RGBA16Float for BC6H - exactly what the project's texture library (rltex,
++ * docs/notes/textures.md section 3) decodes to - or, when the ASTC cache has every
++ * subresource of a texture, an ASTC texture of the cached block size.
++ *
++ * Decoding and the cache live on the unix side (src/winemetal/unix/bc_emul.c, unix calls
++ * WMTBCEmulQuery / WMTBCEmulAcquire); this header is the PE-side interface.
++ *
++ * Switches (environment of the process):
++ *   DXMT_DEBUG_FORCE_NO_BC=1  behave as if MTLDevice.supportsBCTextureCompression were false
++ *   DXMT_BC_CACHE_DIR=<dir>   rltex documents root (unix side); unset = no ASTC cache
++ *   DXMT_BC_CONFIG=<file>     rltex port.toml subset (ASTC block sizes)
++ *   DXMT_BC_SHADOW=1          keep the original blocks of DEFAULT / IMMUTABLE BC textures so
++ *                             they can be copied back to a STAGING BC texture. ASTC-backed
++ *                             textures always keep them (they cannot be decoded back).
++ *   DXMT_BC_ASTC_DEFAULT=0    only IMMUTABLE textures may be ASTC-backed (default: also DEFAULT
++ *                             textures that are shader-resource-only)
++ *   DXMT_BC_LOG=1             unix side: one stderr line per cache lookup
++ */
++#include "Metal.hpp"
++#include "dxgi.h"
++#include "thread.hpp"
++#include <cstdint>
++#include <memory>
++#include <vector>
++
++namespace dxmt {
++namespace bc {
++
++enum class Kind : uint32_t { BC1 = 1, BC2, BC3, BC4, BC5, BC6H, BC7 }; /* == rltex_bc_kind */
++
++struct FormatInfo {
++  DXGI_FORMAT format;          /* canonical DXGI format (TYPELESS maps to UNORM / UF16) */
++  Kind kind;
++  bool srgb;
++  bool is_signed;              /* BC4/BC5 SNORM, BC6H SF16 */
++  uint32_t block_bytes;        /* 8 or 16 */
++  WMTPixelFormat bc_format;    /* the native Metal BC format */
++  WMTPixelFormat decoded;      /* substitute Metal format (rltex decode target) */
++  uint32_t decoded_bytes;      /* bytes per texel of `decoded` */
++};
++
++/** nullptr when `format` is not one of the BC1-BC7 DXGI formats (TYPELESS included). */
++const FormatInfo *GetFormatInfo(DXGI_FORMAT format);
++
++/** MTLDevice.supportsBCTextureCompression, or false under DXMT_DEBUG_FORCE_NO_BC=1. */
++bool DeviceSupportsBC(WMT::Device device);
++
++/** True when BC formats must be emulated: the device (as seen above) lacks BC and the unix
++    side was built with rltex. Evaluated once per process (single GPU). */
++bool EmulationActive(WMT::Device device);
++
++/** The unix side has a usable ASTC cache root (DXMT_BC_CACHE_DIR). */
++bool CacheEnabled();
++
++inline uint32_t
++BlocksOf(uint32_t texels) {
++  return (texels + 3u) >> 2;
++}
++
++/** Copy a cols x rows x depth rectangle of blocks between two block arrays. */
++void CopyBlocks(
++    uint8_t *dst, size_t dst_row_pitch, size_t dst_slice_pitch, const uint8_t *src, size_t src_row_pitch,
++    size_t src_slice_pitch, uint32_t block_bytes, uint32_t cols, uint32_t rows, uint32_t depth
++);
++
++/**
++ * Decode tightly packed blocks (BlocksOf(w) x BlocksOf(h) per depth slice) to the substitute
++ * format: `w * h * d * decoded_bytes` bytes, tight rows, cropped to w x h. No cache, no key.
++ */
++bool Decode(const FormatInfo &info, uint32_t w, uint32_t h, uint32_t d, const uint8_t *blocks, std::vector<uint8_t> &out);
++
++/** Result of a cache-aware lookup of one whole 2D surface (initial data). */
++struct Surface {
++  bool astc = false;
++  std::vector<uint8_t> data; /* decoded pixels (tight rows) or ASTC payload */
++  uint32_t block_x = 0;
++  uint32_t block_y = 0;
++  uint32_t profile = 0;      /* rltex_astc_profile: 0 LDR, 1 LDR sRGB, 2 HDR */
++  char swizzle[8] = {};
++};
++
++/** rltex_acquire: ASTC hit -> payload; miss -> decoded pixels + .bc saved + miss log. */
++bool Acquire(
++    const FormatInfo &info, DXGI_FORMAT dxgi, uint32_t w, uint32_t h, uint32_t mip, uint32_t slice,
++    const uint8_t *blocks, Surface &out
++);
++
++/** Metal ASTC format for a block size + profile (0 LDR, 1 LDR sRGB, 2 HDR); Invalid if illegal. */
++WMTPixelFormat AstcPixelFormat(uint32_t block_x, uint32_t block_y, uint32_t profile);
++
++struct Region {
++  uint32_t x, y, z; /* texels; x and y multiples of 4 for BC */
++  uint32_t w, h, d;
++};
++
++/**
++ * Emulation state of one D3D11 texture (DEFAULT / IMMUTABLE / DYNAMIC): which Metal format
++ * backs it, and the optional CPU copy of the original blocks.
++ */
++class TextureState {
++public:
++  TextureState(
++      const FormatInfo &info, uint32_t width, uint32_t height, uint32_t depth, uint32_t mip_levels,
++      uint32_t array_slices, bool keep_shadow
++  );
++
++  const FormatInfo &
++  format() const {
++    return info_;
++  }
++
++  /* ---- Metal backing ------------------------------------------------------------------ */
++  /** Back the texture with ASTC (`ldr` = the LDR / HDR format, `srgb` = its sRGB sibling or
++      Invalid) and apply `swizzle` ("rgba", "r001", "ra01") to every view. */
++  void setAstc(WMTPixelFormat ldr, WMTPixelFormat srgb, const char *swizzle);
++  bool
++  isAstc() const {
++    return astc_;
++  }
++  /** Maps a view format requested in terms of the substitute format to the format of the
++      actual Metal texture (identity unless ASTC-backed). */
++  WMTPixelFormat mapViewFormat(WMTPixelFormat requested) const;
++
++  /* ---- geometry ------------------------------------------------------------------------ */
++  uint32_t
++  mipLevels() const {
++    return mips_;
++  }
++  void mipSize(uint32_t mip, uint32_t &w, uint32_t &h, uint32_t &d) const;
++
++  /* ---- shadow copy of the original blocks --------------------------------------------- */
++  bool
++  shadowEnabled() const {
++    return keep_shadow_;
++  }
++  /** Replace a whole subresource (tight blocks, depth-major). */
++  void shadowStoreSubresource(uint32_t sub, std::vector<uint8_t> &&blocks);
++  /** Store a region given as tight blocks (BlocksOf(w) x BlocksOf(h) x d). */
++  void shadowStoreRegion(uint32_t sub, uint32_t mip, const Region &r, const uint8_t *blocks);
++  /** Load a region as tight blocks. False if the shadow is unknown (never kept / invalidated). */
++  bool shadowLoadRegion(uint32_t sub, uint32_t mip, const Region &r, uint8_t *blocks_out);
++  /** The shadow of `sub` no longer matches the texture (copy from a source without shadow). */
++  void shadowInvalidate(uint32_t sub);
++
++private:
++  enum : uint8_t { Zero = 0, Valid = 1, Unknown = 2 };
++  const FormatInfo &info_;
++  uint32_t width_, height_, depth_, mips_, slices_;
++  bool keep_shadow_;
++  bool astc_ = false;
++  WMTPixelFormat astc_ldr_ = WMTPixelFormatInvalid;
++  WMTPixelFormat astc_srgb_ = WMTPixelFormatInvalid;
++  uint32_t swizzle_flag_ = 0;
++  dxmt::mutex mutex_;
++  std::vector<std::vector<uint8_t>> shadow_;
++  std::vector<uint8_t> shadow_state_;
++};
++
++/** D3D11_SUBRESOURCE_DATA, without the d3d11 headers. */
++struct InitialSubresource {
++  const void *data;
++  uint32_t row_pitch;
++  uint32_t slice_pitch;
++};
++
++/** One subresource of the initial data, prepared for upload. */
++struct PreparedSubresource {
++  std::vector<uint8_t> blocks; /* original blocks, tight (kept as the shadow) */
++  std::vector<uint8_t> data;   /* decoded pixels or ASTC payload */
++  bool astc = false;
++  uint32_t width = 0, height = 0, depth = 1;
++  uint32_t bytes_per_row = 0;
++  uint32_t bytes_per_image = 0;
++  uint32_t block_x = 0, block_y = 0, profile = 0;
++  char swizzle[8] = {};
++};
++
++/**
++ * Gather the initial data of every subresource (D3D11 pitches -> tight blocks) and decode it,
++ * consulting the ASTC cache when `allow_astc`. If every subresource hits the cache with one
++ * block size / profile / swizzle the result is ASTC-backed (`state` is switched with
++ * TextureState::setAstc and `*astc_base` receives the Metal format); otherwise any cache hit
++ * is decoded from the blocks and the result is decoded-backed.
++ */
++bool PrepareInitialData(
++    const FormatInfo &info, TextureState &state, uint32_t width, uint32_t height, uint32_t depth, uint32_t mips,
++    uint32_t slices, const InitialSubresource *initial_data, bool allow_astc, std::vector<PreparedSubresource> &out,
++    WMTPixelFormat *astc_base
++);
++
++/** DXMT_BC_ASTC_DEFAULT (default on): DEFAULT-usage textures may be ASTC-backed too. */
++bool AstcDefaultUsageAllowed();
++
++/** DXMT_BC_SHADOW=1. */
++bool ShadowRequested();
++
++} // namespace bc
++} // namespace dxmt
+diff --git a/src/dxmt/dxmt_format.cpp b/src/dxmt/dxmt_format.cpp
+index 002c355..2882601 100644
+--- a/src/dxmt/dxmt_format.cpp
++++ b/src/dxmt/dxmt_format.cpp
+@@ -1,5 +1,6 @@
+ #include "ftl.hpp"
+ #include "dxmt_format.hpp"
++#include "dxmt_bc_emulation.hpp"
+ #include "util_error.hpp"
+ #include "dxgi.h"
+ #include <cassert>
+@@ -112,22 +113,27 @@ FormatCapabilityInspector::Inspect(WMT::Device device) {
+     )
+ 
+     // compressed
+-    if (device.supportsBCTextureCompression()) {
++    // BC: native, or emulated (dxmt_bc_emulation.hpp) with the same sample / filter capabilities and
++    // no render target, UAV or blend. DXMT_DEBUG_FORCE_NO_BC=1 makes DeviceSupportsBC() false.
++    if (bc::DeviceSupportsBC(device) || bc::EmulationActive(device)) {
++      // emulated BC cannot be tiled (Sparse), rendered to, written or blended
++      const FormatCapability BC_CAP =
++          bc::DeviceSupportsBC(device) ? FormatCapability::Filter | FormatCapability::Sparse : FormatCapability::Filter;
+       // BC
+-      APPEND_CAP(WMTPixelFormatBC1_RGBA, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC1_RGBA_sRGB, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC2_RGBA, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC2_RGBA_sRGB, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC3_RGBA, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC3_RGBA_sRGB, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC4_RUnorm, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC4_RSnorm, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC5_RGSnorm, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC5_RGUnorm, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC6H_RGBUfloat, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC6H_RGBFloat, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC7_RGBAUnorm, FormatCapability::Filter | FormatCapability::Sparse)
+-      APPEND_CAP(WMTPixelFormatBC7_RGBAUnorm_sRGB, FormatCapability::Filter | FormatCapability::Sparse)
++      APPEND_CAP(WMTPixelFormatBC1_RGBA, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC1_RGBA_sRGB, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC2_RGBA, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC2_RGBA_sRGB, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC3_RGBA, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC3_RGBA_sRGB, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC4_RUnorm, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC4_RSnorm, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC5_RGSnorm, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC5_RGUnorm, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC6H_RGBUfloat, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC6H_RGBFloat, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC7_RGBAUnorm, BC_CAP)
++      APPEND_CAP(WMTPixelFormatBC7_RGBAUnorm_sRGB, BC_CAP)
+     }
+ 
+     // YUV
+@@ -336,6 +342,34 @@ Forget_sRGB(WMTPixelFormat format) {
+     return WMTPixelFormatPVRTC_RGB_2BPP;
+   case WMTPixelFormatPVRTC_RGB_4BPP_sRGB:
+     return WMTPixelFormatPVRTC_RGB_4BPP;
++  case WMTPixelFormatASTC_4x4_sRGB:
++    return WMTPixelFormatASTC_4x4_LDR;
++  case WMTPixelFormatASTC_5x4_sRGB:
++    return WMTPixelFormatASTC_5x4_LDR;
++  case WMTPixelFormatASTC_5x5_sRGB:
++    return WMTPixelFormatASTC_5x5_LDR;
++  case WMTPixelFormatASTC_6x5_sRGB:
++    return WMTPixelFormatASTC_6x5_LDR;
++  case WMTPixelFormatASTC_6x6_sRGB:
++    return WMTPixelFormatASTC_6x6_LDR;
++  case WMTPixelFormatASTC_8x5_sRGB:
++    return WMTPixelFormatASTC_8x5_LDR;
++  case WMTPixelFormatASTC_8x6_sRGB:
++    return WMTPixelFormatASTC_8x6_LDR;
++  case WMTPixelFormatASTC_8x8_sRGB:
++    return WMTPixelFormatASTC_8x8_LDR;
++  case WMTPixelFormatASTC_10x5_sRGB:
++    return WMTPixelFormatASTC_10x5_LDR;
++  case WMTPixelFormatASTC_10x6_sRGB:
++    return WMTPixelFormatASTC_10x6_LDR;
++  case WMTPixelFormatASTC_10x8_sRGB:
++    return WMTPixelFormatASTC_10x8_LDR;
++  case WMTPixelFormatASTC_10x10_sRGB:
++    return WMTPixelFormatASTC_10x10_LDR;
++  case WMTPixelFormatASTC_12x10_sRGB:
++    return WMTPixelFormatASTC_12x10_LDR;
++  case WMTPixelFormatASTC_12x12_sRGB:
++    return WMTPixelFormatASTC_12x12_LDR;
+   case WMTPixelFormatEAC_RGBA8_sRGB:
+     return WMTPixelFormatEAC_RGBA8;
+   case WMTPixelFormatETC2_RGB8_sRGB:
+@@ -380,6 +414,34 @@ Recall_sRGB(WMTPixelFormat format) {
+     return WMTPixelFormatPVRTC_RGB_2BPP_sRGB;
+   case WMTPixelFormatPVRTC_RGB_4BPP:
+     return WMTPixelFormatPVRTC_RGB_4BPP_sRGB;
++  case WMTPixelFormatASTC_4x4_LDR:
++    return WMTPixelFormatASTC_4x4_sRGB;
++  case WMTPixelFormatASTC_5x4_LDR:
++    return WMTPixelFormatASTC_5x4_sRGB;
++  case WMTPixelFormatASTC_5x5_LDR:
++    return WMTPixelFormatASTC_5x5_sRGB;
++  case WMTPixelFormatASTC_6x5_LDR:
++    return WMTPixelFormatASTC_6x5_sRGB;
++  case WMTPixelFormatASTC_6x6_LDR:
++    return WMTPixelFormatASTC_6x6_sRGB;
++  case WMTPixelFormatASTC_8x5_LDR:
++    return WMTPixelFormatASTC_8x5_sRGB;
++  case WMTPixelFormatASTC_8x6_LDR:
++    return WMTPixelFormatASTC_8x6_sRGB;
++  case WMTPixelFormatASTC_8x8_LDR:
++    return WMTPixelFormatASTC_8x8_sRGB;
++  case WMTPixelFormatASTC_10x5_LDR:
++    return WMTPixelFormatASTC_10x5_sRGB;
++  case WMTPixelFormatASTC_10x6_LDR:
++    return WMTPixelFormatASTC_10x6_sRGB;
++  case WMTPixelFormatASTC_10x8_LDR:
++    return WMTPixelFormatASTC_10x8_sRGB;
++  case WMTPixelFormatASTC_10x10_LDR:
++    return WMTPixelFormatASTC_10x10_sRGB;
++  case WMTPixelFormatASTC_12x10_LDR:
++    return WMTPixelFormatASTC_12x10_sRGB;
++  case WMTPixelFormatASTC_12x12_LDR:
++    return WMTPixelFormatASTC_12x12_sRGB;
+   case WMTPixelFormatEAC_RGBA8:
+     return WMTPixelFormatEAC_RGBA8_sRGB;
+   case WMTPixelFormatETC2_RGB8:
+@@ -436,6 +498,7 @@ DepthStencilPlanarFlags(WMTPixelFormat format) {
+ int32_t
+ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &description) {
+   description.PixelFormat = WMTPixelFormatInvalid;
++  description.BCPixelFormat = WMTPixelFormatInvalid;
+   description.AttributeFormat = WMTAttributeFormatInvalid;
+   description.BytesPerTexel = 0;
+   description.Flag = 0;
+@@ -1056,6 +1119,17 @@ MTLQueryDXGIFormat(WMT::Device device, uint32_t format, MTL_DXGI_FORMAT_DESC &de
+     return E_FAIL;
+   }
+ 
++  if ((description.Flag & MTL_DXGI_FORMAT_BC) && bc::EmulationActive(device)) {
++    // The device cannot sample BC: the Metal texture uses the format rltex decodes to
++    // (RGBA8 / R8 / RG8 / RGBA16F). The block layout seen by the application (BlockSize,
++    // MTL_DXGI_FORMAT_BC) is unchanged.
++    if (auto info = bc::GetFormatInfo((DXGI_FORMAT)format)) {
++      description.BCPixelFormat = description.PixelFormat;
++      description.PixelFormat = info->decoded;
++      description.Flag |= MTL_DXGI_FORMAT_EMULATED_BC;
++    }
++  }
++
+   return S_OK;
+ }
+ 
+diff --git a/src/dxmt/dxmt_format.hpp b/src/dxmt/dxmt_format.hpp
+index 7c01d30..dccb8b1 100644
+--- a/src/dxmt/dxmt_format.hpp
++++ b/src/dxmt/dxmt_format.hpp
+@@ -46,10 +46,15 @@ enum MTL_DXGI_FORMAT_FLAG {
+   MTL_DXGI_FORMAT_STENCIL_PLANER = 32,
+   MTL_DXGI_FORMAT_EMULATED_D24 = 256,
+   MTL_DXGI_FORMAT_EMULATED_LINEAR_DEPTH_STENCIL = 512,
++  /* BC format on a device without BC support (dxmt_bc_emulation.hpp): PixelFormat is the
++     substitute Metal format, BCPixelFormat the native BC one, BlockSize / MTL_DXGI_FORMAT_BC
++     still describe the D3D11-visible block layout. */
++  MTL_DXGI_FORMAT_EMULATED_BC = 1024,
+ };
+ 
+ struct MTL_DXGI_FORMAT_DESC {
+   WMTPixelFormat PixelFormat;
++  WMTPixelFormat BCPixelFormat; /* only valid with MTL_DXGI_FORMAT_EMULATED_BC */
+   WMTAttributeFormat AttributeFormat;
+   union {
+     uint32_t BytesPerTexel;
+diff --git a/src/dxmt/dxmt_texture.cpp b/src/dxmt/dxmt_texture.cpp
+index 8da29ea..50ab778 100644
+--- a/src/dxmt/dxmt_texture.cpp
++++ b/src/dxmt/dxmt_texture.cpp
+@@ -1,4 +1,5 @@
+ #include "dxmt_texture.hpp"
++#include "dxmt_bc_emulation.hpp"
+ #include "dxmt_residency.hpp"
+ #include "wsi_platform.hpp"
+ #include <atomic>
+@@ -89,8 +90,18 @@ Texture::prepareAllocationViews(TextureAllocation *allocation) {
+   allocation->version_ = version_;
+ }
+ 
++void
++Texture::setBCState(std::shared_ptr<bc::TextureState> state) {
++  bc_ = std::move(state);
++}
++
+ TextureViewKey
+-Texture::createView(TextureViewDescriptor const &descriptor) {
++Texture::createView(TextureViewDescriptor const &requested) {
++  TextureViewDescriptor descriptor = requested;
++  // ASTC-backed BC emulation: views are requested in terms of the substitute format (RGBA8,
++  // R8, ...) by the D3D11 layer; the Metal texture is ASTC, with a swizzle for BC4 / BC5.
++  if (bc_ && bc_->isAstc())
++    descriptor.format = bc_->mapViewFormat(requested.format);
+   std::unique_lock<dxmt::shared_mutex> lock(mutex_);
+   unsigned i = 0;
+   for (; i < version_; i++) {
+diff --git a/src/dxmt/dxmt_texture.hpp b/src/dxmt/dxmt_texture.hpp
+index 9315ccf..5460828 100644
+--- a/src/dxmt/dxmt_texture.hpp
++++ b/src/dxmt/dxmt_texture.hpp
+@@ -7,9 +7,14 @@
+ #include "thread.hpp"
+ #include "util_flags.hpp"
+ #include "util_svector.hpp"
++#include <memory>
+ 
+ namespace dxmt {
+ 
++namespace bc {
++class TextureState;
++}
++
+ enum class TextureAllocationFlag : uint32_t {
+   GpuReadonly = 0,
+   NoTracking = 0,
+@@ -250,6 +255,17 @@ public:
+ 
+   TextureViewKey fullView;
+ 
++  /**
++  BC emulation state (dxmt_bc_emulation.hpp); null for ordinary textures. When the texture is
++  ASTC-backed, createView() maps every view format to the ASTC format (with its swizzle).
++  Set before the first view is created.
++  */
++  void setBCState(std::shared_ptr<bc::TextureState> state);
++  bc::TextureState *
++  bcState() const {
++    return bc_.get();
++  }
++
+   Rc<TextureAllocation> allocate(Flags<TextureAllocationFlag> flags);
+   Rc<TextureAllocation> import(mach_port_t mach_port);
+ 
+@@ -279,6 +295,7 @@ private:
+   small_vector<TextureViewDescriptor, 4> viewDescriptors_;
+   dxmt::shared_mutex mutex_;
+   WMT::Device device_;
++  std::shared_ptr<bc::TextureState> bc_;
+ };
+ 
+ class RenamableTexturePool {
+diff --git a/src/dxmt/meson.build b/src/dxmt/meson.build
+index 6b8902d..64463ce 100644
+--- a/src/dxmt/meson.build
++++ b/src/dxmt/meson.build
+@@ -1,5 +1,6 @@
+ dxmt_src = [
+   'dxmt_format.cpp',
++  'dxmt_bc_emulation.cpp',
+   'dxmt_names.cpp',
+   'dxmt_command_queue.cpp',
+   'dxmt_command.cpp',

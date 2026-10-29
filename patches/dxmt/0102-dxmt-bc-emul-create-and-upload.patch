@@ -1,0 +1,318 @@
+diff --git a/src/d3d11/d3d11_device.cpp b/src/d3d11/d3d11_device.cpp
+index 6a8caca..ce70467 100644
+--- a/src/d3d11/d3d11_device.cpp
++++ b/src/d3d11/d3d11_device.cpp
+@@ -506,7 +506,11 @@ public:
+       outFormatSupport |= D3D11_FORMAT_SUPPORT_IA_INDEX_BUFFER;
+     }
+ 
+-    auto Capability = GetMTLPixelFormatCapability(metal_format.PixelFormat);
++    // Emulated BC (dxmt_bc_emulation.hpp) keeps the capabilities of the BC format (sample / filter,
++    // no render target), not those of the RGBA8 / R8 / RG8 / RGBA16F texture behind it.
++    auto Capability = GetMTLPixelFormatCapability(
++        (metal_format.Flag & MTL_DXGI_FORMAT_EMULATED_BC) ? metal_format.BCPixelFormat : metal_format.PixelFormat
++    );
+ 
+     if (any_bit_set(Capability & FormatCapability::Color)) {
+       outFormatSupport |= D3D11_FORMAT_SUPPORT_RENDER_TARGET;
+@@ -621,7 +625,11 @@ public:
+                                     metal_format))) {
+         return E_INVALIDARG;
+       }
+-      auto Capability = GetMTLPixelFormatCapability(metal_format.PixelFormat);
++      // Emulated BC (dxmt_bc_emulation.hpp) keeps the capabilities of the BC format (sample / filter,
++      // no render target), not those of the RGBA8 / R8 / RG8 / RGBA16F texture behind it.
++      auto Capability = GetMTLPixelFormatCapability(
++          (metal_format.Flag & MTL_DXGI_FORMAT_EMULATED_BC) ? metal_format.BCPixelFormat : metal_format.PixelFormat
++      );
+ 
+       if (any_bit_set(Capability & FormatCapability::TextureBufferRead)) {
+         info->OutFormatSupport2 |= D3D11_FORMAT_SUPPORT2_UAV_TYPED_LOAD;
+diff --git a/src/d3d11/d3d11_texture.cpp b/src/d3d11/d3d11_texture.cpp
+index c692b36..c879175 100644
+--- a/src/d3d11/d3d11_texture.cpp
++++ b/src/d3d11/d3d11_texture.cpp
+@@ -1,14 +1,59 @@
+ #include "d3d11_texture.hpp"
+ #include "d3d11_resource.hpp"
++#include "dxmt_bc_emulation.hpp"
++#include "dxmt_format.hpp"
+ 
+ namespace dxmt {
+ 
++/**
++BC on a device without BC support (dxmt_bc_emulation.hpp): decode the application's blocks and
++replaceRegion() the pixels of the substitute format instead. Returns false (and does nothing)
++when `format` is not an emulated BC format.
++*/
++static bool
++InitializeEmulatedBCTextureData(
++    MTLD3D11Device *pDevice, WMT::Texture target, DXGI_FORMAT format, uint32_t width, uint32_t height, uint32_t depth,
++    uint32_t mips, uint32_t slices, const D3D11_SUBRESOURCE_DATA *subresources
++) {
++  MTL_DXGI_FORMAT_DESC format_desc;
++  if (FAILED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), format, format_desc)) ||
++      !(format_desc.Flag & MTL_DXGI_FORMAT_EMULATED_BC))
++    return false;
++  auto info = bc::GetFormatInfo(format);
++  for (uint32_t level = 0; level < mips; level++) {
++    uint32_t w = std::max(1u, width >> level), h = std::max(1u, height >> level), d = std::max(1u, depth >> level);
++    uint32_t cols = bc::BlocksOf(w), rows = bc::BlocksOf(h);
++    size_t row_bytes = size_t(cols) * info->block_bytes;
++    for (uint32_t slice = 0; slice < slices; slice++) {
++      auto &src = subresources[D3D11CalcSubresource(level, slice, mips)];
++      size_t src_row = src.SysMemPitch ? std::max<size_t>(src.SysMemPitch, row_bytes) : row_bytes;
++      size_t src_slice = src.SysMemSlicePitch ? src.SysMemSlicePitch : src_row * rows;
++      std::vector<uint8_t> blocks(row_bytes * rows * d), pixels;
++      bc::CopyBlocks(
++          blocks.data(), row_bytes, row_bytes * rows, static_cast<const uint8_t *>(src.pSysMem), src_row, src_slice,
++          info->block_bytes, cols, rows, d
++      );
++      if (!bc::Decode(*info, w, h, d, blocks.data(), pixels))
++        continue;
++      target.replaceRegion(
++          {0, 0, 0}, {w, h, d}, level, slice, pixels.data(), size_t(w) * info->decoded_bytes,
++          size_t(w) * h * info->decoded_bytes
++      );
++    }
++  }
++  return true;
++}
++
+ template <>
+ void InitializeTextureData(MTLD3D11Device *pDevice, WMT::Texture target,
+                            const D3D11_TEXTURE3D_DESC1 &Desc,
+                            const D3D11_SUBRESOURCE_DATA *subresources) {
+   if (subresources == nullptr)
+     return;
++  if (InitializeEmulatedBCTextureData(
++          pDevice, target, Desc.Format, Desc.Width, Desc.Height, Desc.Depth, Desc.MipLevels, 1, subresources
++      ))
++    return;
+   uint32_t width = Desc.Width;
+   uint32_t height = Desc.Height;
+   uint32_t depth = Desc.Depth;
+@@ -29,6 +74,10 @@ void InitializeTextureData(MTLD3D11Device *pDevice, WMT::Texture target,
+                            const D3D11_SUBRESOURCE_DATA *subresources) {
+   if (subresources == nullptr)
+     return;
++  if (InitializeEmulatedBCTextureData(
++          pDevice, target, Desc.Format, Desc.Width, Desc.Height, 1, Desc.MipLevels, Desc.ArraySize, subresources
++      ))
++    return;
+   uint32_t width = Desc.Width;
+   uint32_t height = Desc.Height;
+   for (uint32_t level = 0; level < Desc.MipLevels; level++) {
+@@ -56,6 +105,10 @@ void InitializeTextureData(MTLD3D11Device *pDevice, WMT::Texture target,
+                            const D3D11_SUBRESOURCE_DATA *subresources) {
+   if (subresources == nullptr)
+     return;
++  if (InitializeEmulatedBCTextureData(
++          pDevice, target, Desc.Format, Desc.Width, 1, 1, Desc.MipLevels, Desc.ArraySize, subresources
++      ))
++    return;
+   uint32_t width = Desc.Width;
+   for (uint32_t level = 0; level < Desc.MipLevels; level++) {
+     for (uint32_t slice = 0; slice < Desc.ArraySize; slice++) {
+diff --git a/src/d3d11/d3d11_texture_device.cpp b/src/d3d11/d3d11_texture_device.cpp
+index 55ee999..ede62fb 100644
+--- a/src/d3d11/d3d11_texture_device.cpp
++++ b/src/d3d11/d3d11_texture_device.cpp
+@@ -5,6 +5,8 @@
+ #include "dxmt_dynamic.hpp"
+ #include "dxmt_staging.hpp"
+ #include "dxmt_texture.hpp"
++#include "dxmt_bc_emulation.hpp"
++#include "dxmt_format.hpp"
+ #include "d3d11_resource.hpp"
+ #include "util_win32_compat.h"
+ 
+@@ -336,7 +338,61 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+   }
+   bool single_subresource = info.mipmap_level_count == 1 && info.array_length == 1 &&
+                             !(finalDesc.MiscFlags & D3D11_RESOURCE_MISC_TEXTURECUBE);
++
++  auto shared_flag =
++      D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
++
++  // BC on a device without BC support (dxmt_bc_emulation.hpp): decode the initial data (or look
++  // it up in the ASTC cache) before the Metal texture exists, because a cache hit changes the
++  // pixel format the texture is created with.
++  std::shared_ptr<bc::TextureState> bc_state;
++  std::vector<bc::PreparedSubresource> bc_prepared;
++  {
++    MTL_DXGI_FORMAT_DESC bc_format;
++    if (SUCCEEDED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, bc_format)) &&
++        (bc_format.Flag & MTL_DXGI_FORMAT_EMULATED_BC)) {
++      auto bc_info = bc::GetFormatInfo(finalDesc.Format);
++      uint32_t w = finalDesc.Width, h = 1, depth = 1, slices = 1;
++      if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE3D_DESC1>) {
++        h = finalDesc.Height;
++        depth = finalDesc.Depth;
++      } else if constexpr (std::is_same_v<typename tag::DESC1, D3D11_TEXTURE2D_DESC1>) {
++        h = finalDesc.Height;
++        slices = finalDesc.ArraySize;
++      } else {
++        slices = finalDesc.ArraySize;
++      }
++      uint32_t mips = finalDesc.MipLevels;
++      bc_state = std::make_shared<bc::TextureState>(*bc_info, w, h, depth, mips, slices, bc::ShadowRequested());
++      if (pInitialData) {
++        std::vector<bc::InitialSubresource> src(size_t(mips) * slices);
++        for (auto sub : EnumerateSubresources(finalDesc)) {
++          auto &d = pInitialData[sub.SubresourceId];
++          src[sub.SubresourceId] = {d.pSysMem, d.SysMemPitch, d.SysMemSlicePitch};
++        }
++        // Only textures nobody can write to later may be ASTC-backed: an ASTC texture cannot
++        // take decoded pixels. IMMUTABLE, or DEFAULT + shader-resource-only (DXMT_BC_ASTC_DEFAULT=0
++        // restricts this to IMMUTABLE).
++        bool allow_astc = !(finalDesc.MiscFlags & shared_flag) && finalDesc.CPUAccessFlags == 0 &&
++                          (finalDesc.Usage == D3D11_USAGE_IMMUTABLE ||
++                           (finalDesc.Usage == D3D11_USAGE_DEFAULT && bc::AstcDefaultUsageAllowed() &&
++                            finalDesc.BindFlags == D3D11_BIND_SHADER_RESOURCE));
++        WMTPixelFormat astc_base = WMTPixelFormatInvalid;
++        if (!bc::PrepareInitialData(
++                *bc_info, *bc_state, w, h, depth, mips, slices, src.data(), allow_astc, bc_prepared, &astc_base
++            ))
++          return E_FAIL;
++        if (astc_base != WMTPixelFormatInvalid) {
++          info.pixel_format = astc_base;
++          info.usage = info.usage | WMTTextureUsagePixelFormatView;
++        }
++      }
++    }
++  }
++
+   auto texture = Rc<Texture>(new Texture(info, pDevice->GetMTLDevice()));
++  if (bc_state)
++    texture->setBCState(bc_state);
+ 
+   auto &initializer = pDevice->GetDXMTDevice().queue().initializer;
+ 
+@@ -346,6 +402,15 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+       for (auto sub : EnumerateSubresources(finalDesc)) {
+         initializer.initWithZero(texture.ptr(), texture->current(), sub.ArraySlice, sub.MipLevel);
+       }
++    } else if (bc_state) {
++      for (auto sub : EnumerateSubresources(finalDesc)) {
++        auto &p = bc_prepared[sub.SubresourceId];
++        initializer.initWithPackedData(
++            texture.ptr(), texture->current(), sub.ArraySlice, sub.MipLevel, p.data.data(), p.data.size(),
++            p.bytes_per_row, p.bytes_per_image, p.width, p.height, p.depth
++        );
++        bc_state->shadowStoreSubresource(sub.SubresourceId, std::move(p.blocks));
++      }
+     } else {
+       for (auto sub : EnumerateSubresources(finalDesc)) {
+         auto &data = pInitialData[sub.SubresourceId];
+@@ -357,8 +422,6 @@ HRESULT CreateDeviceTextureInternal(MTLD3D11Device *pDevice,
+     }
+   };
+ 
+-  auto shared_flag =
+-      D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
+   if (finalDesc.MiscFlags & shared_flag) {
+     if (!(pDevice->GetLocalD3DKMT() & 0xc0000000)) {
+       ERR("DeviceTexture: Invalid device handle");
+diff --git a/src/d3d11/d3d11_texture_dynamic.cpp b/src/d3d11/d3d11_texture_dynamic.cpp
+index da9a7cc..1d6abe9 100644
+--- a/src/d3d11/d3d11_texture_dynamic.cpp
++++ b/src/d3d11/d3d11_texture_dynamic.cpp
+@@ -7,6 +7,8 @@
+ #include "dxmt_texture.hpp"
+ #include "d3d11_resource.hpp"
+ #include "d3d11_enumerable.hpp"
++#include "dxmt_bc_emulation.hpp"
++#include "dxmt_format.hpp"
+ 
+ namespace dxmt {
+ 
+@@ -110,6 +112,12 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
+     return E_INVALIDARG;
+   }
+ 
++  // BC on a device without BC support: the application sees block memory (the per-subresource
++  // buffers below keep BC layout), the Metal texture holds decoded pixels. Map / Unmap decodes.
++  MTL_DXGI_FORMAT_DESC bc_format;
++  bool bc_emulated = SUCCEEDED(MTLQueryDXGIFormat(pDevice->GetMTLDevice(), finalDesc.Format, bc_format)) &&
++                     (bc_format.Flag & MTL_DXGI_FORMAT_EMULATED_BC);
++
+   std::vector<Subresource> subresources;
+   for (auto &sub : EnumerateSubresources(finalDesc)) {
+     uint32_t bpr, bpi, buf_len;
+@@ -117,7 +125,11 @@ HRESULT CreateDynamicTextureInternal(MTLD3D11Device *pDevice,
+       return E_FAIL;
+     }
+     Flags<BufferAllocationFlag> buffer_flags;
+-    buffer_flags.set(BufferAllocationFlag::CpuWriteCombined, BufferAllocationFlag::SuballocateFromOnePage);
++    // Write-combined memory is slow to read, and Unmap of an emulated BC texture reads it back.
++    if (bc_emulated)
++      buffer_flags.set(BufferAllocationFlag::SuballocateFromOnePage);
++    else
++      buffer_flags.set(BufferAllocationFlag::CpuWriteCombined, BufferAllocationFlag::SuballocateFromOnePage);
+ #ifdef __i386__
+     buffer_flags.set(BufferAllocationFlag::CpuPlaced);
+ #endif
+diff --git a/src/dxmt/dxmt_resource_initializer.cpp b/src/dxmt/dxmt_resource_initializer.cpp
+index 67e291a..838b83d 100644
+--- a/src/dxmt/dxmt_resource_initializer.cpp
++++ b/src/dxmt/dxmt_resource_initializer.cpp
+@@ -289,6 +289,38 @@ ResourceInitializer::initWithData(
+   return current_seq_id_;
+ }
+ 
++uint64_t
++ResourceInitializer::initWithPackedData(
++    const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
++    size_t size, size_t bytes_per_row, size_t bytes_per_image, uint32_t width, uint32_t height, uint32_t depth
++) {
++  bool is_3d_tex = texture->textureType() == WMTTextureType3D;
++
++  std::lock_guard<dxmt::mutex> lock(mutex_);
++  // A real retry loop: when a heap is full the ALLOC_* macros flush and `continue`.
++  for (;;) {
++    RETAIN(allocation);
++    ALLOC_GPU(temp, size);
++    temp.updateContents(temp_offset, data, size);
++    // last: the command is linked into the blit list as soon as it is allocated
++    ALLOC_BLIT(wmtcmd_blit_copy_from_buffer_to_texture, copy);
++
++    copy->type = WMTBlitCommandCopyFromBufferToTexture;
++    copy->src = temp;
++    copy->src_offset = temp_offset;
++    copy->bytes_per_row = bytes_per_row;
++    copy->bytes_per_image = is_3d_tex ? bytes_per_image : 0;
++    copy->size = {width, height, depth};
++    copy->dst = allocation->texture();
++    copy->slice = slice;
++    copy->level = level;
++    copy->origin = {0, 0, 0};
++    break;
++  }
++
++  return current_seq_id_;
++}
++
+ std::uint64_t
+ ResourceInitializer::flushInternal() {
+   auto pool = WMT::MakeAutoreleasePool();
+diff --git a/src/dxmt/dxmt_resource_initializer.hpp b/src/dxmt/dxmt_resource_initializer.hpp
+index 3a51e7c..664bc53 100644
+--- a/src/dxmt/dxmt_resource_initializer.hpp
++++ b/src/dxmt/dxmt_resource_initializer.hpp
+@@ -31,6 +31,15 @@ public:
+       const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
+       size_t row_pitch, size_t depth_pitch
+   );
++  /**
++   * BC emulation (dxmt_bc_emulation.hpp): upload one subresource whose bytes are already in
++   * the Metal texture's own layout - decoded pixels, or ASTC blocks - tightly packed.
++   * `bytes_per_image` is the size of one depth slice (3D textures only).
++   */
++  uint64_t initWithPackedData(
++      const Texture *texture, TextureAllocation *allocation, uint32_t slice, uint32_t level, const void *data,
++      size_t size, size_t bytes_per_row, size_t bytes_per_image, uint32_t width, uint32_t height, uint32_t depth
++  );
+ 
+   /*
+    * Flush pending works and return the event id to wait

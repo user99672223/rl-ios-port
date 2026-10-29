@@ -95,21 +95,11 @@ jobs:
   # What does a hosted macos-15 runner give us? (Metal device, BC support, Rosetta, Wine)
   probe:
     runs-on: macos-15
-    needs: [setup-wine]
     steps:
-      - uses: actions/checkout@v6
-      - name: Restore Wine
-        uses: actions/cache/restore@v5
-        with:
-          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
-          path: ./toolchains/wine
-          fail-on-cache-miss: true
       - name: System
         run: |
           uname -a; sw_vers; sysctl -n machdep.cpu.brand_string; sysctl hw.ncpu hw.memsize
-          ls /Applications | grep -i xcode || true
           xcode-select -p
-          system_profiler SPDisplaysDataType || true
       - name: Metal device probe
         run: |
           cat > /tmp/probe.m <<'EOF'
@@ -117,43 +107,120 @@ jobs:
           #import <Foundation/Foundation.h>
           int main(void) {
             @autoreleasepool {
-              NSArray<id<MTLDevice>> *devs = MTLCopyAllDevices();
-              printf("PROBE devices: %lu\n", (unsigned long)devs.count);
-              id<MTLDevice> d = MTLCreateSystemDefaultDevice();
-              printf("PROBE default: %s\n", d ? d.name.UTF8String : "(null)");
-              for (id<MTLDevice> dev in devs) {
-                printf("PROBE device %s lowPower=%d headless=%d unified=%d\n", dev.name.UTF8String, dev.isLowPower, dev.isHeadless, dev.hasUnifiedMemory);
-                printf("PROBE supportsBCTextureCompression=%d\n", dev.supportsBCTextureCompression);
-                printf("PROBE families: apple1..9 =");
+              for (id<MTLDevice> dev in MTLCopyAllDevices()) {
+                printf("PROBE device %s unified=%d supportsBCTextureCompression=%d\n", dev.name.UTF8String, dev.hasUnifiedMemory, dev.supportsBCTextureCompression);
+                printf("PROBE families apple1..9 =");
                 for (int f = 1001; f <= 1009; f++) printf(" %d", [dev supportsFamily:(MTLGPUFamily)f]);
-                printf("\nPROBE mac2=%d common3=%d metal3=%d\n", [dev supportsFamily:MTLGPUFamilyMac2], [dev supportsFamily:MTLGPUFamilyCommon3], [dev supportsFamily:MTLGPUFamilyMetal3]);
-                printf("PROBE argumentBuffersSupport=%lu\n", (unsigned long)dev.argumentBuffersSupport);
-                printf("PROBE maxBufferLength=%llu recommendedMaxWorkingSet=%llu\n", (unsigned long long)dev.maxBufferLength, (unsigned long long)dev.recommendedMaxWorkingSetSize);
-                // ASTC and BC texture creation
-                MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_6x6_LDR width:64 height:64 mipmapped:NO];
-                printf("PROBE ASTC_6x6_LDR texture: %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
-                td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatASTC_4x4_HDR width:64 height:64 mipmapped:NO];
-                printf("PROBE ASTC_4x4_HDR texture: %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
-                td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBC7_RGBAUnorm width:64 height:64 mipmapped:NO];
-                printf("PROBE BC7 texture: %s\n", [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
+                printf(" mac2=%d metal3=%d argumentBuffers=%lu\n", [dev supportsFamily:MTLGPUFamilyMac2], [dev supportsFamily:MTLGPUFamilyMetal3], (unsigned long)dev.argumentBuffersSupport);
+                MTLPixelFormat fmts[] = {MTLPixelFormatASTC_4x4_LDR, MTLPixelFormatASTC_6x6_LDR, MTLPixelFormatASTC_6x6_sRGB, MTLPixelFormatASTC_4x4_HDR, MTLPixelFormatBC7_RGBAUnorm};
+                const char *names[] = {"ASTC_4x4_LDR", "ASTC_6x6_LDR", "ASTC_6x6_sRGB", "ASTC_4x4_HDR", "BC7"};
+                for (int i = 0; i < 5; i++) {
+                  MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmts[i] width:64 height:64 mipmapped:NO];
+                  printf("PROBE texture %s: %s\n", names[i], [dev newTextureWithDescriptor:td] ? "ok" : "FAILED");
+                }
               }
             }
             return 0;
           }
           EOF
-          clang -fobjc-arc -o /tmp/probe /tmp/probe.m -framework Metal -framework Foundation
+          clang -fobjc-arc -arch x86_64 -o /tmp/probe /tmp/probe.m -framework Metal -framework Foundation
           /tmp/probe
-          echo "--- x86_64 (Rosetta)"
-          clang -fobjc-arc -arch x86_64 -o /tmp/probe_x86 /tmp/probe.m -framework Metal -framework Foundation
-          /tmp/probe_x86 || echo "x86_64 run failed (Rosetta missing?)"
+
+  build-and-test:
+    runs-on: macos-15
+    needs: [setup-wine, setup-llvm-mingw, setup-llvm-darwin]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+      - name: Submodules (DXMT, bcdec, astc-encoder)
+        run: |
+          git submodule update --init --depth 1 external/dxmt external/bcdec external/astc-encoder
+          git -C external/dxmt submodule update --init --depth 1 include/native/directx
+      - name: Restore Wine
+        uses: actions/cache/restore@v5
+        with:
+          key: wine-x86_64-${{ env.WINE_VERSION }}-macos
+          path: ./toolchains/wine
+          fail-on-cache-miss: true
+      - name: Restore LLVM-MinGW
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-mingw-${{ env.LLVM_MINGW_VERSION }}-macos
+          path: ./toolchains/${{ env.LLVM_MINGW_DIR }}
+          fail-on-cache-miss: true
+      - name: Restore LLVM Darwin (x86_64)
+        uses: actions/cache/restore@v5
+        with:
+          key: llvm-darwin-${{ env.LLVM_VERSION }}-x86_64-macos
+          path: ./toolchains/llvm-darwin
+          fail-on-cache-miss: true
       - name: Rosetta
+        run: arch -x86_64 /usr/bin/true || sudo softwareupdate --install-rosetta --agree-to-license
+      - name: Select Xcode 16.1 (as DXMT's CI)
+        run: sudo xcode-select -s /Applications/Xcode_16.1.app
+      - name: Install Meson (as DXMT's CI)
+        run: pip3 install meson==1.10.0 --break-system-packages
+      - name: Apply patches/dxmt/* (0001 iOS port, 01xx BC emulation)
+        run: tools/apply_patches.sh dxmt
+      - name: Stage rltex (runtime/textures + bcdec) into DXMT's winemetal unix lib
+        run: tests/d3d11/bc_textures/stage_rltex.sh "$PWD" "$PWD/external/dxmt"
+      - name: Build DXMT (x86_64 cross build, as DXMT's CI clang-release job)
         run: |
-          arch -x86_64 /usr/bin/true && echo "rosetta ok" || { sudo softwareupdate --install-rosetta --agree-to-license; arch -x86_64 /usr/bin/true && echo "rosetta installed"; }
-      - name: Wine smoke
+          export PATH="$PATH:$GITHUB_WORKSPACE/toolchains/${{ env.LLVM_MINGW_DIR }}/bin"
+          cd external/dxmt
+          meson setup --cross-file build-win64.txt \
+            -Dnative_llvm_path="$GITHUB_WORKSPACE/toolchains/llvm-darwin" \
+            -Dwine_install_path="$GITHUB_WORKSPACE/toolchains/wine" \
+            build --buildtype release --prefix "$GITHUB_WORKSPACE/dxmt-install" --strip
+          meson compile -C build
+          meson install -C build
+          ls -R "$GITHUB_WORKSPACE/dxmt-install" | head -40
+      - name: Build bc_textures.exe
         run: |
-          export PATH="$PWD/toolchains/wine/bin:$PATH"
-          ls toolchains/wine/bin | head -30
-          file toolchains/wine/bin/wine64 || file toolchains/wine/bin/wine || true
-          export WINEPREFIX=$PWD/prefix WINEDEBUG=-all
-          (timeout 600 wine64 wineboot -i || timeout 600 wine wineboot -i) 2>&1 | tail -20
-          timeout 120 wine64 cmd /c echo hello-from-wine 2>&1 | tail -5
+          export PATH="$PATH:$GITHUB_WORKSPACE/toolchains/${{ env.LLVM_MINGW_DIR }}/bin"
+          make -C tests/d3d11/bc_textures CXX=x86_64-w64-mingw32-clang++ CXXFLAGS="-O1 -g0 -std=c++17 -Wall -Wextra -Wno-unused-parameter" LDFLAGS="-static"
+          file tests/d3d11/bc_textures/bc_textures.exe
+      - name: Build astcenc + rltex CLI (offline encoder inputs for the cache-hit run)
+        run: |
+          cmake -G Ninja -S external/astc-encoder -B build/astcenc -DCMAKE_BUILD_TYPE=Release -DASTCENC_ISA_NEON=ON -DASTCENC_CLI=ON -DASTCENC_WERROR=OFF
+          cmake --build build/astcenc
+          cmake -G Ninja -S runtime/textures -B build/rltex -DCMAKE_BUILD_TYPE=Release -DRLTEX_BCDEC_DIR="$PWD/external/bcdec"
+          cmake --build build/rltex
+          ls build/astcenc/Source/astcenc-neon build/rltex/rltex
+      - name: Metal device (what DXMT will see)
+        run: |
+          cat > /tmp/probe.m <<'EOF'
+          #import <Metal/Metal.h>
+          int main(void) { for (id<MTLDevice> d in MTLCopyAllDevices()) printf("device %s bc=%d apple7=%d mac2=%d\n", d.name.UTF8String, d.supportsBCTextureCompression, [d supportsFamily:MTLGPUFamilyApple7], [d supportsFamily:MTLGPUFamilyMac2]); return 0; }
+          EOF
+          clang -fobjc-arc -o /tmp/probe /tmp/probe.m -framework Metal -framework Foundation && /tmp/probe
+      - name: Run bc_textures.exe under Wine (native, forced no-BC, ASTC cache populate + hit)
+        env:
+          WINEDLLOVERRIDES: "mscoree,mshtml="
+        run: |
+          mkdir -p out
+          tests/d3d11/bc_textures/run_ci.sh --wine "$GITHUB_WORKSPACE/toolchains/wine" --dxmt "$GITHUB_WORKSPACE/dxmt-install" \
+            --exe "$GITHUB_WORKSPACE/tests/d3d11/bc_textures/bc_textures.exe" --out "$GITHUB_WORKSPACE/out" \
+            --astcenc "$GITHUB_WORKSPACE/build/astcenc/Source/astcenc-neon" --rltex "$GITHUB_WORKSPACE/build/rltex/rltex"
+      - name: Cache listing
+        if: always()
+        run: |
+          mkdir -p out
+          { ls -la out/bccache/cache/textures 2>/dev/null | head -80; echo; head -20 out/bccache/logs/texture_miss.log 2>/dev/null; } > out/bccache-listing.txt || true
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: dxmt-bc-logs
+          path: |
+            out/summary.txt
+            out/logs
+            out/dxmt-logs
+            out/bccache-listing.txt
+            out/bccache/logs
+      - name: Upload DXMT install
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: dxmt-bc-install
+          path: dxmt-install

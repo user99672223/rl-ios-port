@@ -1,0 +1,384 @@
+diff --git a/src/nativemetal/meson.build b/src/nativemetal/meson.build
+index 2c037f8..2cffb6f 100644
+--- a/src/nativemetal/meson.build
++++ b/src/nativemetal/meson.build
+@@ -2,6 +2,7 @@ winemetal_src = [
+   '../winemetal/winemetal_thunks.c',
+   '../winemetal/unix/winemetal_unix.c',
+   '../winemetal/unix/cache.c',
++  '../winemetal/unix/bc_emul.c', # stubs here: BC emulation is wired for the Wine build only
+ ]
+ winemetal_link_depends = []
+ 
+diff --git a/src/winemetal/unix/bc_emul.c b/src/winemetal/unix/bc_emul.c
+new file mode 100644
+index 0000000..b97dcaa
+--- /dev/null
++++ b/src/winemetal/unix/bc_emul.c
+@@ -0,0 +1,186 @@
++/*
++ * BC texture emulation bridge: unix side (patches/dxmt/0100).
++ *
++ * Metal devices without BC support (Apple GPUs before the M1 family on iOS: A16 and friends)
++ * cannot sample BC1-BC7. The PE side (d3d11.dll) keeps D3D11's BC semantics and calls this
++ * file, through unix calls 132 / 133, for every surface of BC blocks it has to turn into
++ * something Metal can sample. This file is a thin adapter over the project's texture library
++ * (runtime/textures, `rltex`, contract in docs/notes/textures.md):
++ *
++ *   rltex_acquire()    key = SHA-256(header || blob); ASTC cache hit -> payload;
++ *                      miss -> bcdec decode, save <key>.bc once, append the miss log
++ *   rltex_bc_decode()  plain decode (UpdateSubresource, Map/Unmap, copies: no cache, no key)
++ *
++ * Environment (unix side, i.e. the environment `wine` was started with):
++ *   DXMT_BC_CACHE_DIR   rltex "documents root" (<root>/cache/textures/<key>.astc ...). Unset =
++ *                       cache off: everything is decoded, nothing is saved or logged.
++ *   DXMT_BC_CONFIG      optional port.toml subset parsed by rltex_config_load_file()
++ *                       (astc_bc*_block, astc_bc6h_mode)
++ *   DXMT_BC_LOG=1       one stderr line per cache lookup (HIT / MISS) for CI logs
++ *
++ * Without rltex sources staged next to this file (see src/winemetal/unix/meson.build) the
++ * file compiles to stubs and WMTBCEmulQuery() reports "not available"; DXMT then behaves
++ * exactly as before the patch (BC formats not advertised on devices without BC support).
++ */
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define WINEMETAL_API
++#include "../winemetal_thunks.h"
++
++typedef int NTSTATUS;
++#define STATUS_SUCCESS 0
++
++#ifdef DXMT_BC_WITH_RLTEX
++#include "rltex.h"
++
++static pthread_once_t g_once = PTHREAD_ONCE_INIT;
++static rltex_ctx *g_ctx;
++static int g_log;
++
++static void
++bc_emul_init(void) {
++  rltex_config cfg;
++  const char *root = getenv("DXMT_BC_CACHE_DIR");
++  const char *conf = getenv("DXMT_BC_CONFIG");
++  const char *log = getenv("DXMT_BC_LOG");
++  g_log = log && log[0] == '1';
++
++  rltex_config_defaults(&cfg);
++  /* BC6H -> ASTC HDR needs MTLPixelFormatASTC_*_HDR; availability on the A16 is not confirmed
++     (docs/notes/textures.md section 3). Default to the decoded RGBA16F upload, a config file
++     with `astc_bc6h_mode = "astc_hdr"` opts in. */
++  cfg.bc6h_astc_hdr = 0;
++  if (conf && conf[0]) {
++    char err[512] = {0};
++    int bad = rltex_config_load_file(&cfg, conf, err, sizeof err);
++    if (bad < 0)
++      fprintf(stderr, "bc-emul: cannot read %s: %s\n", conf, rltex_status_string(bad));
++    else if (bad)
++      fprintf(stderr, "bc-emul: %d invalid value(s) in %s:\n%s\n", bad, conf, err);
++  }
++  /* No astc-encoder linked in here: the library would ignore this anyway. The offline
++     encoder (tools/textures/encode.py) is what turns saved .bc blobs into .astc files. */
++  cfg.background_encode = 0;
++
++  if (root && root[0]) {
++    int r = rltex_ctx_create(root, &cfg, &g_ctx);
++    if (r != RLTEX_OK) {
++      fprintf(stderr, "bc-emul: cache disabled, rltex_ctx_create(%s) failed: %s\n", root, rltex_status_string(r));
++      g_ctx = NULL;
++    } else if (g_log) {
++      fprintf(stderr, "bc-emul: cache root %s\n", root);
++    }
++  }
++}
++
++NTSTATUS
++bc_emul_query(void *obj) {
++  struct unixcall_generic_obj_uint64_ret *params = obj;
++  pthread_once(&g_once, bc_emul_init);
++  params->ret = WMT_BCEMUL_AVAILABLE | (g_ctx ? WMT_BCEMUL_CACHE_ON : 0);
++  return STATUS_SUCCESS;
++}
++
++static void
++copy_swizzle(char dst[8], const char *src) {
++  memset(dst, 0, 8);
++  if (src)
++    strncpy(dst, src, 7);
++}
++
++NTSTATUS
++bc_emul_acquire(void *obj) {
++  struct unixcall_generic_obj_ptr_noret *params = obj;
++  struct WMTBCEmulInfo *info = params->arg.ptr;
++  rltex_desc desc;
++  pthread_once(&g_once, bc_emul_init);
++
++  info->status = RLTEX_E_ARG;
++  info->source = WMTBCEmulSourceNone;
++  info->out_size = 0;
++  info->key[0] = 0;
++  copy_swizzle(info->view_swizzle, "rgba");
++  if (!info->blob.ptr || !info->out.ptr)
++    return STATUS_SUCCESS;
++
++  desc.dxgi_format = info->dxgi_format;
++  desc.width = info->width;
++  desc.height = info->height;
++  desc.mip_level = info->mip_level;
++  desc.array_slice = info->array_slice;
++
++  if ((info->flags & WMT_BCEMUL_USE_CACHE) && g_ctx) {
++    rltex_tex tex;
++    int r = rltex_acquire(g_ctx, &desc, info->blob.ptr, (size_t)info->blob_size, &tex);
++    info->status = r;
++    if (r != RLTEX_OK)
++      return STATUS_SUCCESS;
++    strncpy(info->key, tex.key, sizeof info->key - 1);
++    info->key[sizeof info->key - 1] = 0;
++    if (tex.source == RLTEX_SRC_ASTC_CACHE) {
++      if (tex.astc_size > info->out_capacity) {
++        info->status = RLTEX_E_SIZE;
++      } else {
++        memcpy(info->out.ptr, tex.astc_data, tex.astc_size);
++        info->out_size = tex.astc_size;
++        info->source = WMTBCEmulSourceAstc;
++        info->astc_block_x = tex.astc_block_x;
++        info->astc_block_y = tex.astc_block_y;
++        info->astc_profile = (uint32_t)tex.astc_profile;
++        copy_swizzle(info->view_swizzle, tex.view_swizzle);
++      }
++    } else if (tex.pixels_size > info->out_capacity) {
++      info->status = RLTEX_E_SIZE;
++    } else {
++      memcpy(info->out.ptr, tex.pixels, tex.pixels_size);
++      info->out_size = tex.pixels_size;
++      info->source = WMTBCEmulSourceDecoded;
++      info->pixfmt = (uint32_t)tex.pixfmt;
++    }
++    if (g_log)
++      fprintf(
++          stderr, "bc-emul: %s key=%s dxgi=%u %ux%u mip=%u slice=%u%s\n",
++          info->source == WMTBCEmulSourceAstc ? "HIT " : "MISS", tex.key, desc.dxgi_format, desc.width, desc.height,
++          desc.mip_level, desc.array_slice,
++          info->source == WMTBCEmulSourceAstc ? "" : (tex.queued_for_encode ? " (queued)" : "")
++      );
++    rltex_tex_release(&tex);
++    return STATUS_SUCCESS;
++  }
++
++  {
++    rltex_pixfmt pf = (rltex_pixfmt)0;
++    int r = rltex_bc_decode(&desc, info->blob.ptr, (size_t)info->blob_size, info->out.ptr, (size_t)info->out_capacity, &pf);
++    info->status = r;
++    if (r == RLTEX_OK) {
++      size_t n = (size_t)desc.width * desc.height * rltex_pixfmt_bytes(pf);
++      info->out_size = n;
++      info->source = WMTBCEmulSourceDecoded;
++      info->pixfmt = (uint32_t)pf;
++    }
++  }
++  return STATUS_SUCCESS;
++}
++
++#else /* !DXMT_BC_WITH_RLTEX */
++
++NTSTATUS
++bc_emul_query(void *obj) {
++  struct unixcall_generic_obj_uint64_ret *params = obj;
++  params->ret = 0;
++  return STATUS_SUCCESS;
++}
++
++NTSTATUS
++bc_emul_acquire(void *obj) {
++  struct unixcall_generic_obj_ptr_noret *params = obj;
++  struct WMTBCEmulInfo *info = params->arg.ptr;
++  info->status = -8; /* RLTEX_E_UNSUPPORTED */
++  info->source = WMTBCEmulSourceNone;
++  return STATUS_SUCCESS;
++}
++
++#endif
+diff --git a/src/winemetal/unix/meson.build b/src/winemetal/unix/meson.build
+index 3f20c2b..5b913d9 100644
+--- a/src/winemetal/unix/meson.build
++++ b/src/winemetal/unix/meson.build
+@@ -1,8 +1,28 @@
+ winemetal_unix_src = [
+   'winemetal_unix.c',
+   'cache.c',
++  'bc_emul.c',
+ ]
+ 
++# BC texture emulation (patches/dxmt/0100): bc_emul.c wraps the project's rltex library.
++# The sources are staged here by tests/d3d11/bc_textures/stage_rltex.sh (rltex.h, src/*.c from
++# runtime/textures, bcdec.h from external/bcdec). Not staged: bc_emul.c builds to stubs and
++# DXMT behaves as it did before the patch on devices without BC support.
++bc_unix_c_args = []
++bc_unix_link_with = []
++if fs.is_file('rltex/rltex.h') and fs.is_file('rltex/bcdec.h')
++  rltex_lib = static_library('rltex', [
++      'rltex/sha256.c', 'rltex/format.c', 'rltex/bc_decode.c', 'rltex/config.c',
++      'rltex/fs.c', 'rltex/astc_encode.c', 'rltex/ctx.c', 'rltex/platform.c',
++    ],
++    include_directories : include_directories('rltex'),
++    native              : true,
++    pic                 : true,
++  )
++  bc_unix_c_args += ['-DDXMT_BC_WITH_RLTEX=1', '-I' + meson.current_source_dir() / 'rltex']
++  bc_unix_link_with += [rltex_lib]
++endif
++
+ if wine_build_path != ''
+   winemac_so = join_paths(wine_build_path, 'dlls/winemac.drv/winemac.so')
+   ntdll_so = join_paths(wine_build_path, 'dlls/ntdll/ntdll.so')
+@@ -28,7 +48,8 @@ shared_library('winemetal', winemetal_unix_src,
+   name_prefix         : '',
+   dependencies        : [ airconv_dep_darwin ],
+   include_directories : dxmt_include_path,
+-  c_args              : ['-ObjC'],
++  c_args              : ['-ObjC'] + bc_unix_c_args,
++  link_with           : bc_unix_link_with,
+   link_args           : winemetal_unix_ld_args,
+   native              : true,
+   name_suffix         : 'so',
+diff --git a/src/winemetal/unix/winemetal_unix.c b/src/winemetal/unix/winemetal_unix.c
+index ab79b88..ade411c 100644
+--- a/src/winemetal/unix/winemetal_unix.c
++++ b/src/winemetal/unix/winemetal_unix.c
+@@ -31,6 +31,10 @@ typedef int NTSTATUS;
+ #define STATUS_SUCCESS 0
+ #define STATUS_UNSUCCESSFUL 0xC0000001
+ 
++/* BC emulation bridge, unix/bc_emul.c (unix call 132 / 133). */
++NTSTATUS bc_emul_query(void *obj);
++NTSTATUS bc_emul_acquire(void *obj);
++
+ void
+ execute_on_main(dispatch_block_t block) {
+   if ([NSThread isMainThread]) {
+@@ -340,6 +344,11 @@ to_metal_swizzle(struct WMTTextureSwizzleChannels swizzle, enum WMTPixelFormat f
+         MTLTextureSwizzleOne, (MTLTextureSwizzle)swizzle.r, MTLTextureSwizzleOne, MTLTextureSwizzleOne
+     );
+   }
++  if (format & WMTPixelFormatRA01Swizzle) {
++    return MTLTextureSwizzleChannelsMake(
++        (MTLTextureSwizzle)swizzle.r, (MTLTextureSwizzle)swizzle.a, MTLTextureSwizzleZero, MTLTextureSwizzleOne
++    );
++  }
+   if (format & WMTPixelFormatGBARSwizzle) {
+     return MTLTextureSwizzleChannelsMake(
+         (MTLTextureSwizzle)swizzle.g, (MTLTextureSwizzle)swizzle.b, (MTLTextureSwizzle)swizzle.a,
+@@ -3079,6 +3088,8 @@ const void *__wine_unix_call_funcs[] = {
+     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+     &_MTLCommandBuffer_property,
+     &_MTLDevice_newTileRenderPipelineState,
++    &bc_emul_query,
++    &bc_emul_acquire,
+ };
+ 
+ #ifndef DXMT_NATIVE
+@@ -3215,5 +3226,7 @@ const void *__wine_unix_call_wow64_funcs[] = {
+     &_MTLCommandBuffer_blitCommandEncoderWithSampleBuffers,
+     &_MTLCommandBuffer_property,
+     &_MTLDevice_newTileRenderPipelineState,
++    &bc_emul_query,
++    &bc_emul_acquire,
+ };
+ #endif
+diff --git a/src/winemetal/winemetal.h b/src/winemetal/winemetal.h
+index 92740e3..cc8fd61 100644
+--- a/src/winemetal/winemetal.h
++++ b/src/winemetal/winemetal.h
+@@ -448,9 +448,13 @@ enum WMTPixelFormat : uint32_t {
+ 
+   WMTPixelFormatGBARSwizzle = 0x00100000,
+ 
++  /* BC5 sampled from an ASTC texture whose encoder swizzle was rrrg: view (r, a, 0, 1).
++     (BC emulation, patches/dxmt/0100; docs/notes/textures.md "BC4/BC5 rrr1/rrrg"). */
++  WMTPixelFormatRA01Swizzle = 0x00080000,
++
+   WMTPixelFormatBGRA4Unorm = WMTPixelFormatGBARSwizzle | WMTPixelFormatABGR4Unorm,
+ 
+-  WMTPixelFormatCustomSwizzle = WMTPixelFormatRGB1Swizzle | WMTPixelFormatR001Swizzle | WMTPixelFormat0R01Swizzle | WMTPixelFormatGBARSwizzle,
++  WMTPixelFormatCustomSwizzle = WMTPixelFormatRGB1Swizzle | WMTPixelFormatR001Swizzle | WMTPixelFormat0R01Swizzle | WMTPixelFormatGBARSwizzle | WMTPixelFormatRA01Swizzle,
+ };
+ 
+ #define ORIGINAL_FORMAT(format) (format & ~WMTPixelFormatCustomSwizzle)
+@@ -1924,4 +1928,47 @@ WINEMETAL_API obj_handle_t MTLDevice_newTileRenderPipelineState(
+     obj_handle_t device, const struct WMTTileRenderPipelineInfo *info, obj_handle_t *err_out
+ );
+ 
++/*
++ * BC texture emulation bridge (patches/dxmt/0100). Implemented in unix/bc_emul.c on top of the
++ * project's rltex library (runtime/textures): bcdec decode, ASTC cache lookup by content key,
++ * `.bc` blob save and miss log.
++ */
++#define WMT_BCEMUL_AVAILABLE 1u /* WMTBCEmulQuery: unix side was built with rltex */
++#define WMT_BCEMUL_CACHE_ON 2u  /* WMTBCEmulQuery: DXMT_BC_CACHE_DIR is set and usable */
++
++#define WMT_BCEMUL_USE_CACHE 1u /* WMTBCEmulInfo.flags: key lookup / blob save / miss log */
++
++enum WMTBCEmulSource : uint32_t {
++  WMTBCEmulSourceNone = 0,
++  WMTBCEmulSourceDecoded = 1, /* out = tightly packed pixels, `pixfmt` = rltex_pixfmt */
++  WMTBCEmulSourceAstc = 2,    /* out = ASTC payload (16 bytes per block, no file header) */
++};
++
++struct WMTBCEmulInfo {
++  struct WMTConstMemoryPointer blob; // in: tightly packed BC blocks of one 2D surface
++  struct WMTMemoryPointer out;       // in: result buffer
++  uint64_t blob_size;                // in
++  uint64_t out_capacity;             // in
++  uint64_t out_size;                 // out
++  uint32_t dxgi_format;              // in: BC DXGI_FORMAT (TYPELESS accepted)
++  uint32_t width;                    // in: texel size of THIS mip level (or region)
++  uint32_t height;                   // in
++  uint32_t mip_level;                // in: key material
++  uint32_t array_slice;              // in: key material
++  uint32_t flags;                    // in: WMT_BCEMUL_*
++  int32_t status;                    // out: rltex status (0 = ok)
++  uint32_t source;                   // out: WMTBCEmulSource
++  uint32_t pixfmt;                   // out: rltex_pixfmt of decoded data
++  uint32_t astc_block_x;             // out
++  uint32_t astc_block_y;             // out
++  uint32_t astc_profile;             // out: rltex_astc_profile (0 LDR, 1 LDR sRGB, 2 HDR)
++  char view_swizzle[8];              // out: "rgba", "r001" or "ra01"
++  char key[72];                      // out: 64 hex chars
++};
++
++STATIC_ASSERT(sizeof(WMTBCEmulInfo) == 168);
++
++WINEMETAL_API uint32_t WMTBCEmulQuery(void);
++WINEMETAL_API void WMTBCEmulAcquire(struct WMTBCEmulInfo *info);
++
+ #endif
+\ No newline at end of file
+diff --git a/src/winemetal/winemetal_thunks.c b/src/winemetal/winemetal_thunks.c
+index af3166e..ceadc52 100644
+--- a/src/winemetal/winemetal_thunks.c
++++ b/src/winemetal/winemetal_thunks.c
+@@ -1179,3 +1179,20 @@ MTLDevice_newTileRenderPipelineState(
+     *err_out = params.ret_error;
+   return params.ret_pso;
+ }
++
++WINEMETAL_API uint32_t
++WMTBCEmulQuery(void) {
++  struct unixcall_generic_obj_uint64_ret params;
++  params.handle = 0;
++  params.ret = 0;
++  UNIX_CALL(132, &params);
++  return (uint32_t)params.ret;
++}
++
++WINEMETAL_API void
++WMTBCEmulAcquire(struct WMTBCEmulInfo *info) {
++  struct unixcall_generic_obj_ptr_noret params;
++  params.handle = 0;
++  WMT_MEMPTR_SET(params.arg, info);
++  UNIX_CALL(133, &params);
++}
