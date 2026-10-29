@@ -28,6 +28,23 @@ jobs:
           done
           echo "error count: $(grep -c 'error:' /tmp/errors.txt || true)"
           exit $rc
+      - name: Link winemetal.so for iOS and check undefined symbols
+        run: |
+          SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cd external/dxmt
+          for f in winemetal_unix cache; do
+            xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -ObjC -O1 \
+              -Iinclude -Isrc/airconv -Isrc/winemetal -Isrc/winemetal/unix \
+              -c src/winemetal/unix/$f.c -o /tmp/$f.o
+          done
+          # Wine (winemac/ntdll replacements) and airconv resolve at load time.
+          xcrun --sdk iphoneos clang -target arm64-apple-ios17.0 -isysroot "$SDK" -dynamiclib \
+            -install_name @rpath/winemetal.so -undefined dynamic_lookup \
+            -framework Foundation -framework Metal -framework MetalFX -framework QuartzCore \
+            -framework CoreGraphics -framework UIKit -lsqlite3 \
+            /tmp/winemetal_unix.o /tmp/cache.o -o /tmp/winemetal.so
+          xcrun nm -u /tmp/winemetal.so | grep -vE '^_(objc_|_objc|OBJC_|_Block|dispatch_|_dispatch|NS|MTL|CA|CG|kCF|CF|sqlite3_|os_|mach_|_mach|pthread_|free|malloc|calloc|realloc|memcpy|memset|memmove|strlen|strcmp|strncmp|strcpy|snprintf|fprintf|printf|abort|__stack_chk|___stack_chk|dlsym|dlopen|getenv|atexit|_Unwind|__cxa|bzero|qsort|fopen|fclose|fread|fwrite|stat|mkdir|unlink|close|open|read|write|time|clock_gettime|usleep|sysctl|puts|putchar|strdup|strndup|strchr|strrchr|strstr|sprintf|vsnprintf|getpid|kill|signal|sigaction|raise|exit|_exit|atomic_|__atomic|_tlv|___chkstk|___memcpy_chk|___memset_chk|___strcpy_chk|___snprintf_chk|___sprintf_chk|_os_|___error|__error|UI)' | tee /tmp/unexpected.txt || true
+          echo "undefined symbols outside system frameworks:"; cat /tmp/unexpected.txt
       - uses: actions/upload-artifact@v4
         if: always()
         with:
