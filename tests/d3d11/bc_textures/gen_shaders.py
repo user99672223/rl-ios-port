@@ -1,32 +1,36 @@
 #!/usr/bin/env python3
-"""Assembles the two Shader Model 4.0 shaders of the BC texture test into DXBC containers
-(shaders.h). No D3D compiler is needed at build or run time: the token streams are written out
-here, with the encodings of libs/DXBCParser/d3d12tokenizedprogramformat.hpp (DXMT's own parser
-header), and the whole thing was checked against Wine's wined3d (see docs/notes/dxmt-bc.md).
+"""Assembles the Shader Model 4.0 shaders of the BC texture test into DXBC containers (shaders.h).
+No D3D compiler is needed at build or run time: the token streams are written out here with the
+encodings of libs/DXBCParser/d3d12tokenizedprogramformat.hpp (DXMT's own parser header), and were
+checked against Wine's wined3d / vkd3d-shader, which parses and disassembles them (see
+docs/notes/dxmt-bc.md).
 
-  vs_4_0   mov o0.xyzw, v0.xyzw                          (float4 POSITION -> SV_Position)
-  ps_4_0   ftoi r0.xyzw, v0.xyzz                         (SV_Position.xy = pixel centre -> texel; z = 0 -> mip 0)
-           ld   o0.xyzw, r0.xyzw, t0.xyzw                (Texture2D.Load(int3(x, y, 0)): the mip is in .w)
+  vs_4_0   mov o0.xyzw, v0.xyzw ; mov o1.xy, v1.xyxx           (float4 POSITION, float2 TEXCOORD)
+  ps_4_0   sample_l o0.xyzw, v1.xyxx, t0.xyzw, s0, l(MIP)      (one shader per mip level 0..3)
 
-With a one-mip shader resource view and a render target of the mip's size, pixel (x, y) shows
-texel (x, y) of the view: every texel of every mip is checked, exactly, without filtering.
+With a point sampler, a shader resource view of the whole mip chain and a render target of the
+mip's size, pixel (x, y) shows texel (x, y) of level MIP: the uv at a pixel centre is
+(x + 0.5) / width. Every texel of every mip is checked, exactly, without filtering.
 
 Usage: gen_shaders.py > shaders.h
 """
+import math
 import struct
 import sys
 
 # opcodes (D3D10_SB_OPCODE_TYPE order in d3d12tokenizedprogramformat.hpp)
-OP_FTOI, OP_LD, OP_MOV, OP_RET = 27, 45, 54, 62
-OP_DCL_RESOURCE, OP_DCL_INPUT, OP_DCL_INPUT_PS_SIV = 88, 95, 100
-OP_DCL_OUTPUT, OP_DCL_OUTPUT_SIV, OP_DCL_TEMPS = 101, 103, 104
+OP_MOV, OP_RET, OP_SAMPLE_L = 54, 62, 72
+OP_DCL_RESOURCE, OP_DCL_SAMPLER, OP_DCL_INPUT, OP_DCL_INPUT_PS = 88, 90, 95, 98
+OP_DCL_OUTPUT, OP_DCL_OUTPUT_SIV = 101, 103
 # operand types
-T_TEMP, T_INPUT, T_OUTPUT, T_RESOURCE = 0, 1, 2, 7
+T_INPUT, T_OUTPUT, T_SAMPLER, T_RESOURCE, T_IMMEDIATE32 = 1, 2, 6, 7, 4
 # misc enums
 NAME_POSITION = 1
-INTERP_LINEAR_NOPERSPECTIVE = 4
+INTERP_LINEAR = 2
 RES_DIM_TEXTURE2D = 3
 RET_FLOAT = 5
+SAMPLER_MODE_DEFAULT = 0
+MAX_MIPS = 4
 
 
 def op_token(opcode, length, ctrl=0):
@@ -44,27 +48,36 @@ def operand(op_type, index, mask=None, swizzle=None, components=2):
     return [tok, index]
 
 
+def scalar_immediate(float_value):
+    """l(x): a one-component IMMEDIATE32 operand (no index)."""
+    return [1 | (T_IMMEDIATE32 << 12), struct.unpack("<I", struct.pack("<f", float_value))[0]]
+
+
 XYZW = (0, 1, 2, 3)
+XYXX = (0, 1, 0, 0)
 
 
 def vs_tokens():
     t = []
     t += [op_token(OP_DCL_INPUT, 3)] + operand(T_INPUT, 0, mask=0xF)
+    t += [op_token(OP_DCL_INPUT, 3)] + operand(T_INPUT, 1, mask=0x3)
     t += [op_token(OP_DCL_OUTPUT_SIV, 4)] + operand(T_OUTPUT, 0, mask=0xF) + [NAME_POSITION]
+    t += [op_token(OP_DCL_OUTPUT, 3)] + operand(T_OUTPUT, 1, mask=0x3)
     t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 0, mask=0xF) + operand(T_INPUT, 0, swizzle=XYZW)
+    t += [op_token(OP_MOV, 5)] + operand(T_OUTPUT, 1, mask=0x3) + operand(T_INPUT, 1, swizzle=XYXX)
     t += [op_token(OP_RET, 1)]
     return t
 
 
-def ps_tokens():
+def ps_tokens(mip):
     t = []
-    t += [op_token(OP_DCL_INPUT_PS_SIV, 4, INTERP_LINEAR_NOPERSPECTIVE)] + operand(T_INPUT, 0, mask=0xF) + [NAME_POSITION]
+    t += [op_token(OP_DCL_SAMPLER, 3, SAMPLER_MODE_DEFAULT)] + operand(T_SAMPLER, 0, components=0)
+    t += [op_token(OP_DCL_INPUT_PS, 3, INTERP_LINEAR)] + operand(T_INPUT, 1, mask=0x3)
     t += [op_token(OP_DCL_RESOURCE, 4, RES_DIM_TEXTURE2D)] + operand(T_RESOURCE, 0, components=0) + [
         RET_FLOAT | RET_FLOAT << 4 | RET_FLOAT << 8 | RET_FLOAT << 12]
     t += [op_token(OP_DCL_OUTPUT, 3)] + operand(T_OUTPUT, 0, mask=0xF)
-    t += [op_token(OP_DCL_TEMPS, 2), 1]
-    t += [op_token(OP_FTOI, 5)] + operand(T_TEMP, 0, mask=0xF) + operand(T_INPUT, 0, swizzle=(0, 1, 2, 2))
-    t += [op_token(OP_LD, 7)] + operand(T_OUTPUT, 0, mask=0xF) + operand(T_TEMP, 0, swizzle=XYZW) + operand(T_RESOURCE, 0, swizzle=XYZW)
+    t += [op_token(OP_SAMPLE_L, 11)] + operand(T_OUTPUT, 0, mask=0xF) + operand(T_INPUT, 1, swizzle=XYXX) + \
+        operand(T_RESOURCE, 0, swizzle=XYZW) + operand(T_SAMPLER, 0, components=0) + scalar_immediate(float(mip))
     t += [op_token(OP_RET, 1)]
     return t
 
@@ -88,7 +101,7 @@ def signature_chunk(fourcc, elements):
     return fourcc, head + entries + names
 
 
-_K = [int(abs(__import__("math").sin(i + 1)) * 2**32) & 0xFFFFFFFF for i in range(64)]
+_K = [int(abs(math.sin(i + 1)) * 2**32) & 0xFFFFFFFF for i in range(64)]
 _S = [7, 12, 17, 22] * 4 + [5, 9, 14, 20] * 4 + [4, 11, 16, 23] * 4 + [6, 10, 15, 21] * 4
 
 
@@ -161,18 +174,22 @@ def array(name, data):
 
 def main():
     vs = container([
-        signature_chunk(b"ISGN", [("POSITION", 0, 0, 0, 0xF, 0xF)]),
-        signature_chunk(b"OSGN", [("SV_Position", 0, NAME_POSITION, 0, 0xF, 0)]),
+        signature_chunk(b"ISGN", [("POSITION", 0, 0, 0, 0xF, 0xF), ("TEXCOORD", 0, 0, 1, 0x3, 0x3)]),
+        signature_chunk(b"OSGN", [("SV_Position", 0, NAME_POSITION, 0, 0xF, 0), ("TEXCOORD", 0, 0, 1, 0x3, 0xC)]),
         shader_chunk(0x00010040, vs_tokens()),
-    ])
-    ps = container([
-        signature_chunk(b"ISGN", [("SV_Position", 0, NAME_POSITION, 0, 0xF, 0xF)]),
-        signature_chunk(b"OSGN", [("SV_Target", 0, 0, 0, 0xF, 0)]),
-        shader_chunk(0x00000040, ps_tokens()),
     ])
     sys.stdout.write("// Generated by gen_shaders.py. Do not edit.\n#pragma once\n")
     sys.stdout.write(array("g_vs_blob", vs))
-    sys.stdout.write(array("g_ps_blob", ps))
+    for mip in range(MAX_MIPS):
+        ps = container([
+            signature_chunk(b"ISGN", [("SV_Position", 0, NAME_POSITION, 0, 0xF, 0), ("TEXCOORD", 0, 0, 1, 0x3, 0x3)]),
+            signature_chunk(b"OSGN", [("SV_Target", 0, 0, 0, 0xF, 0)]),
+            shader_chunk(0x00000040, ps_tokens(mip)),
+        ])
+        sys.stdout.write(array("g_ps_blob_mip%d" % mip, ps))
+    sys.stdout.write("static const unsigned char *const g_ps_blobs[%d] = {%s};\n" % (
+        MAX_MIPS, ", ".join("g_ps_blob_mip%d" % m for m in range(MAX_MIPS))))
+    sys.stdout.write("static const unsigned g_ps_blob_size = sizeof(g_ps_blob_mip0);\n")
 
 
 if __name__ == "__main__":

@@ -45,7 +45,8 @@
 static ID3D11Device *g_dev;
 static ID3D11DeviceContext *g_ctx;
 static ID3D11VertexShader *g_vs;
-static ID3D11PixelShader *g_ps;
+static ID3D11PixelShader *g_ps[4];  // sample_l at level 0..3
+static ID3D11SamplerState *g_samp;
 static ID3D11InputLayout *g_il;
 static ID3D11Buffer *g_vb;
 static ID3D11RasterizerState *g_rs;
@@ -144,8 +145,8 @@ static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, con
   D3D11_SHADER_RESOURCE_VIEW_DESC sd = {};
   sd.Format = (DXGI_FORMAT)fi.srv_format;
   sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-  sd.Texture2D.MostDetailedMip = mip;
-  sd.Texture2D.MipLevels = 1;
+  sd.Texture2D.MostDetailedMip = 0;
+  sd.Texture2D.MipLevels = (UINT)-1;  // the whole chain: the shader picks the level (sample_l)
   Ref<ID3D11ShaderResourceView> srv;
   if (FAILED(hr = g_dev->CreateShaderResourceView(tex, &sd, &srv))) {
     err = "CreateShaderResourceView " + hr_str(hr);
@@ -186,12 +187,13 @@ static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, con
   D3D11_VIEWPORT vp = {0, 0, (float)sv.w, (float)sv.h, 0, 1};
   g_ctx->RSSetViewports(1, &vp);
   g_ctx->RSSetState(g_rs);
-  UINT stride = 16, offset = 0;
+  UINT stride = 24, offset = 0;
   g_ctx->IASetInputLayout(g_il);
   g_ctx->IASetVertexBuffers(0, 1, &g_vb, &stride, &offset);
   g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
   g_ctx->VSSetShader(g_vs, nullptr, 0);
-  g_ctx->PSSetShader(g_ps, nullptr, 0);
+  g_ctx->PSSetShader(g_ps[mip], nullptr, 0);
+  g_ctx->PSSetSamplers(0, 1, &g_samp);
   ID3D11ShaderResourceView *srvs[1] = {srv};
   g_ctx->PSSetShaderResources(0, 1, srvs);
   g_ctx->Draw(3, 0);
@@ -576,17 +578,26 @@ static bool init_device() {
       dxgi->Release();
     }
   }
-  if (FAILED(hr = g_dev->CreateVertexShader(g_vs_blob, sizeof g_vs_blob, nullptr, &g_vs)) ||
-      FAILED(hr = g_dev->CreatePixelShader(g_ps_blob, sizeof g_ps_blob, nullptr, &g_ps))) {
-    printf("FAIL setup: CreateVertexShader/CreatePixelShader %s\n", hr_str(hr).c_str());
+  if (FAILED(hr = g_dev->CreateVertexShader(g_vs_blob, sizeof g_vs_blob, nullptr, &g_vs))) {
+    printf("FAIL setup: CreateVertexShader %s\n", hr_str(hr).c_str());
     return false;
   }
-  D3D11_INPUT_ELEMENT_DESC el = {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0};
-  if (FAILED(hr = g_dev->CreateInputLayout(&el, 1, g_vs_blob, sizeof g_vs_blob, &g_il))) {
+  for (int m = 0; m < 4; m++) {
+    if (FAILED(hr = g_dev->CreatePixelShader(g_ps_blobs[m], g_ps_blob_size, nullptr, &g_ps[m]))) {
+      printf("FAIL setup: CreatePixelShader(level %d) %s\n", m, hr_str(hr).c_str());
+      return false;
+    }
+  }
+  D3D11_INPUT_ELEMENT_DESC el[2] = {
+      {"POSITION", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
+      {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
+  };
+  if (FAILED(hr = g_dev->CreateInputLayout(el, 2, g_vs_blob, sizeof g_vs_blob, &g_il))) {
     printf("FAIL setup: CreateInputLayout %s\n", hr_str(hr).c_str());
     return false;
   }
-  const float tri[3][4] = {{-1, -1, 0, 1}, {-1, 3, 0, 1}, {3, -1, 0, 1}};
+  // one oversized triangle covering the viewport; uv = (0,0) top-left .. (1,1) bottom-right
+  const float tri[3][6] = {{-1, -1, 0, 1, 0, 1}, {-1, 3, 0, 1, 0, -1}, {3, -1, 0, 1, 2, 1}};
   D3D11_BUFFER_DESC bd = {};
   bd.ByteWidth = sizeof tri;
   bd.Usage = D3D11_USAGE_IMMUTABLE;
@@ -594,6 +605,16 @@ static bool init_device() {
   D3D11_SUBRESOURCE_DATA sd = {tri, 0, 0};
   if (FAILED(hr = g_dev->CreateBuffer(&bd, &sd, &g_vb))) {
     printf("FAIL setup: CreateBuffer %s\n", hr_str(hr).c_str());
+    return false;
+  }
+  D3D11_SAMPLER_DESC sm = {};
+  sm.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+  sm.AddressU = sm.AddressV = sm.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+  sm.ComparisonFunc = D3D11_COMPARISON_NEVER;
+  sm.MinLOD = 0;
+  sm.MaxLOD = 16;
+  if (FAILED(hr = g_dev->CreateSamplerState(&sm, &g_samp))) {
+    printf("FAIL setup: CreateSamplerState %s\n", hr_str(hr).c_str());
     return false;
   }
   D3D11_RASTERIZER_DESC rs = {};
@@ -677,7 +698,9 @@ int main(int argc, char **argv) {
   rel(g_rs);
   rel(g_vb);
   rel(g_il);
-  rel(g_ps);
+  for (auto &p : g_ps)
+    rel(p);
+  rel(g_samp);
   rel(g_vs);
   rel(g_ctx);
   rel(g_dev);
