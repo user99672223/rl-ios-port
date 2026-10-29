@@ -136,7 +136,7 @@ static void wait_idle() {
   q->Release();
 }
 
-static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, const SubVec &sv, std::string &err) {
+static bool verify_mip_once(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, const SubVec &sv, std::string &err) {
   const int tol = g_tol >= 0 ? g_tol : (g_flat ? 8 : 3);
   HRESULT hr;
   if (mip == 0)
@@ -231,6 +231,32 @@ static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, con
   if (ok && g_verbose)
     printf("  mip %u ok (%ux%u, worst diff %d)\n", mip, sv.w, sv.h, worst);
   return ok;
+}
+
+// The paravirtual Metal device of hosted macOS runners ("Apple Paravirtual device") sometimes returns zeros
+// the first time a freshly created texture is sampled (seen with unpatched DXMT and native BC as well, so it
+// is not a property of the BC emulation). A real content error is deterministic, so a failed comparison is
+// repeated; --retries N (default 2) bounds that, every retry that was needed is printed and counted.
+static int g_retries = 2;
+static int g_retry_events = 0;
+
+static bool verify_mip(ID3D11Texture2D *tex, const FormatInfo &fi, UINT mip, const SubVec &sv, std::string &err) {
+  std::string first;
+  for (int attempt = 0; attempt <= g_retries; attempt++) {
+    std::string e;
+    if (verify_mip_once(tex, fi, mip, sv, e)) {
+      if (attempt) {
+        g_retry_events++;
+        printf("INFO retry: %s mip %u needed %d repeat(s); first result: %s\n", fi.name, mip, attempt, first.c_str());
+      }
+      return true;
+    }
+    if (attempt == 0)
+      first = e;
+    err = e;
+    wait_idle();
+  }
+  return false;
 }
 
 // Pipeline self-test with an ordinary RGBA8 texture of four mips (8x8 .. 1x1): if this fails, the draw /
@@ -617,6 +643,8 @@ int main(int argc, char **argv) {
       g_verbose = true;
     else if (!strcmp(argv[i], "--sync"))
       g_sync = true;
+    else if (!strcmp(argv[i], "--retries") && i + 1 < argc)
+      g_retries = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--tol") && i + 1 < argc)
       g_tol = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--filter") && i + 1 < argc)
@@ -672,7 +700,7 @@ int main(int argc, char **argv) {
       }
     }
   }
-  printf("SUMMARY %d checks, %d failed\n", total, failures);
+  printf("SUMMARY %d checks, %d failed, %d comparison(s) needed a repeat\n", total, failures, g_retry_events);
 
   rel(g_rs);
   for (auto &p : g_ps)
